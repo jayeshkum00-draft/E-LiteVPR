@@ -223,7 +223,7 @@ def build_model(cfg, device):
     model.load_state_dict(state)
     return model.to(device)
 
-@hydra.main(version_base=None, config_path="../configs", config_name="brisbane_eval")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     device = torch.device(cfg.device)
     modality = cfg.data.modality
