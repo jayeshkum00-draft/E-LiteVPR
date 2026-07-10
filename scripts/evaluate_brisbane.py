@@ -6,9 +6,8 @@ from pathlib import Path
 import hydra
 import numpy as np
 from omegaconf import DictConfig
-import pandas as pd
+import pyarrow.parquet as pq
 import torch
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from brisbane_representation import build_representation
@@ -60,42 +59,90 @@ def latlon_to_xy(lat, lon, lat0, lon0):
     y = np.radians(lat - lat0) * R
     return np.stack([x, y], axis=1)
 
-def load_events(parquet_path, time_offset=0.0):
-    """-> x:int64, y:int64, t:float64 epoch seconds (sorted), p:int64 {0,1}."""
-    df = pd.read_parquet(parquet_path)
-    cols = {c.lower(): c for c in df.columns}
 
-    def col(*names):
-        for n in names:
-            if n in cols:
-                return df[cols[n]].to_numpy()
-        raise KeyError(f"None of {names} in parquet columns {list(df.columns)}")
+def _resolve_columns(pf):
+    names = {n.lower(): n for n in pf.schema_arrow.names}
+    def pick(*cands):
+        for c in cands:
+            if c in names:
+                return names[c]
+        raise KeyError(f"None of {cands} in parquet columns {pf.schema_arrow.names}")
+    return pick("x"), pick("y"), pick("t", "timestamp", "time"), pick("p", "pol", "polarity")
 
-    x = col("x").astype(np.int64)
-    y = col("y").astype(np.int64)
-    t = col("t", "timestamp", "time").astype(np.float64)
-    p = col("p", "pol", "polarity").astype(np.int64)
 
-    # time-unit detection: epoch s ~1.6e9, ms ~1.6e12, us ~1.6e15, ns ~1.6e18
-    tmax = t.max()
-    if tmax > 1e17:
-        t *= 1e-9
-    elif tmax > 1e14:
-        t *= 1e-6
-    elif tmax > 1e11:
-        t *= 1e-3
-    elif tmax < 1e7:
+def event_time_range(parquet_path, time_offset=0.0):
+    """(t_min, t_max) in epoch seconds + unit scale, reading only the first
+    and last row group instead of the whole file."""
+    pf = pq.ParquetFile(parquet_path)
+    _, _, ct, _ = _resolve_columns(pf)
+    n_rg = pf.metadata.num_row_groups
+    t_first = float(pf.read_row_group(0, columns=[ct]).column(0)[0].as_py())
+    t_last = float(pf.read_row_group(n_rg - 1, columns=[ct]).column(0)[-1].as_py())
+
+    if t_last > 1e17:
+        scale = 1e-9
+    elif t_last > 1e14:
+        scale = 1e-6
+    elif t_last > 1e11:
+        scale = 1e-3
+    elif t_last < 1e7:
         raise RuntimeError(
-            f"{parquet_path}: event timestamps look RELATIVE (max={tmax:.3f}). "
-            "GPS alignment needs absolute epoch time; set brisbane.time_offset.")
-    t += time_offset
+            f"{parquet_path}: event timestamps look RELATIVE (max={t_last:.3f}). "
+            "GPS alignment needs absolute epoch time; set datasets.time_offset.")
+    else:
+        scale = 1.0
+    return t_first * scale + time_offset, t_last * scale + time_offset, scale
 
-    p = np.where(p > 0, 1, 0).astype(np.int64)  # {-1,1}/bool -> {0,1}
 
-    if not np.all(np.diff(t) >= 0):
-        order = np.argsort(t, kind="stable")
-        x, y, t, p = x[order], y[order], t[order], p[order]
-    return x, y, t, p
+def stream_window_events(parquet_path, frame_times, dt, scale, time_offset=0.0,
+                         batch_rows=2_000_000):
+    """Single sequential pass over a time-sorted parquet. Yields
+    (frame_idx, x, y, t, p) per window; buffer only ever holds the current
+    read batch + the active window."""
+    pf = pq.ParquetFile(parquet_path)
+    cx, cy, ct, cp = _resolve_columns(pf)
+
+    bx = np.empty(0, np.int64)
+    by = np.empty(0, np.int64)
+    bt = np.empty(0, np.float64)
+    bp = np.empty(0, np.int64)
+    frame_idx = 0
+    last_t = -np.inf
+
+    def emit(f_idx):
+        f0 = frame_times[f_idx]
+        lo = np.searchsorted(bt, f0, side="left")
+        hi = np.searchsorted(bt, f0 + dt, side="left")
+        return f_idx, bx[lo:hi], by[lo:hi], bt[lo:hi], bp[lo:hi]
+
+    for rb in pf.iter_batches(batch_size=batch_rows, columns=[cx, cy, ct, cp]):
+        x = rb.column(0).to_numpy(zero_copy_only=False).astype(np.int64)
+        y = rb.column(1).to_numpy(zero_copy_only=False).astype(np.int64)
+        t = rb.column(2).to_numpy(zero_copy_only=False).astype(np.float64) * scale + time_offset
+        p = np.where(rb.column(3).to_numpy(zero_copy_only=False).astype(np.int64) > 0, 1, 0)
+
+        if t.size == 0:
+            continue
+        if t[0] < last_t or np.any(np.diff(t) < 0):
+            raise RuntimeError(f"{parquet_path}: events not time-sorted; "
+                               "streaming requires a sorted file.")
+        last_t = t[-1]
+
+        bx = np.concatenate((bx, x))
+        by = np.concatenate((by, y))
+        bt = np.concatenate((bt, t))
+        bp = np.concatenate((bp, p))
+
+        while frame_idx < len(frame_times) and frame_times[frame_idx] + dt <= bt[-1]:
+            yield emit(frame_idx)
+            frame_idx += 1
+            if frame_idx < len(frame_times):
+                keep = np.searchsorted(bt, frame_times[frame_idx], side="left")
+                bx, by, bt, bp = bx[keep:], by[keep:], bt[keep:], bp[keep:]
+
+    while frame_idx < len(frame_times):
+        yield emit(frame_idx)
+        frame_idx += 1
 
 
 def resolve_file(directory, key, suffix):
@@ -110,36 +157,6 @@ def resolve_file(directory, key, suffix):
             f"found {len(hits)}: {[f.name for f in hits]}. Available: "
             f"{[f.name for f in directory.rglob(f'*{suffix}')]}")
     return hits[0]
-
-class BrisbaneBinDataset(Dataset):
-    def __init__(self, events, frame_times, dt, modality, cfg):
-        self.x, self.y, self.t, self.p = events
-        self.frame_times = frame_times
-        self.dt = dt
-        self.modality = modality
-        self.cfg = cfg
-
-    def __len__(self):
-        return len(self.frame_times)
-
-    def __getitem__(self, i):
-        t0 = self.frame_times[i]
-        lo = np.searchsorted(self.t, t0, side="left")
-        hi = np.searchsorted(self.t, t0 + self.dt, side="left")
-        return build_representation(
-            self.x[lo:hi], self.y[lo:hi], self.t[lo:hi], self.p[lo:hi],
-            t0, self.dt, self.modality, self.cfg)
-
-
-@torch.no_grad()
-def extract_descriptors(model, loader, device):
-    model.eval()
-    out = []
-    for batch in tqdm(loader, desc="descriptors", leave=False):
-        batch = batch.to(device, non_blocking=True)
-        _, desc = model(batch)   # (projected_patches, GeM global descriptor)
-        out.append(desc.float().cpu())
-    return torch.cat(out, dim=0)
 
 
 def process_traverse(name, cfg, model, device):
@@ -156,47 +173,64 @@ def process_traverse(name, cfg, model, device):
     ev_path = resolve_file(cfg.datasets.root, bag, ".parquet")
     gps_path = resolve_file(cfg.datasets.root, bag, ".nmea")
 
-    x, y, t, p = load_events(ev_path, float(cfg.datasets.get("time_offset", 0.0)))
+    time_offset = float(cfg.datasets.get("time_offset", 0.0))
+    t_min, t_max, scale = event_time_range(ev_path, time_offset)
     gps_t, lat, lon = parse_nmea_rmc(gps_path)
 
-    overlap = min(t[-1], gps_t[-1]) - max(t[0], gps_t[0])
-    print(f"  [{name}] events {t[0]:.1f}..{t[-1]:.1f}  gps {gps_t[0]:.1f}.."
+    overlap = min(t_max, gps_t[-1]) - max(t_min, gps_t[0])
+    print(f"  [{name}] events {t_min:.1f}..{t_max:.1f}  gps {gps_t[0]:.1f}.."
           f"{gps_t[-1]:.1f}  overlap {overlap:.1f}s")
     if overlap <= 0:
         raise RuntimeError(
             f"{name}: no time overlap between events and GPS. Check units / "
-            "set brisbane.time_offset.")
+            "set datasets.time_offset.")
 
     dt = float(cfg.datasets.dt)
-    step = 1.0 / float(cfg.datasets.sample_hz)   # paper: 1 Hz grid
-    t_start = max(t[0], gps_t[0])
-    t_end = min(t[-1] - dt, gps_t[-1] - dt)
+    step = 1.0 / float(cfg.datasets.sample_hz)
+    t_start = max(t_min, gps_t[0])
+    t_end = min(t_max - dt, gps_t[-1] - dt)
     frame_times = np.arange(t_start, t_end, step)
 
-    # GT position at the bin centre
     xy_all = latlon_to_xy(lat, lon, float(cfg.datasets.lat0), float(cfg.datasets.lon0))
     tc = frame_times + dt / 2.0
     xy = np.stack([np.interp(tc, gps_t, xy_all[:, 0]),
                    np.interp(tc, gps_t, xy_all[:, 1])], axis=1)
 
-    # empty bins kept as all-zero representations to preserve the regular
-    # grid that sequence matching relies on
-    lo = np.searchsorted(t, frame_times, side="left")
-    hi = np.searchsorted(t, frame_times + dt, side="left")
-    n_empty = int((hi - lo == 0).sum())
+    model.eval()
+    descs, pending = [], []
+    n_empty = 0
+    batch_size = int(cfg.datasets.batch_size)
+
+    def flush():
+        batch = torch.stack(pending).to(device, non_blocking=True)
+        _, d = model(batch)
+        descs.append(d.float().cpu())
+        pending.clear()
+
+    with torch.no_grad():
+        stream = stream_window_events(ev_path, frame_times, dt, scale, time_offset)
+        for i, ex, ey, et, ep in tqdm(stream, total=len(frame_times),
+                                      desc="descriptors", leave=False):
+            if et.size == 0:
+                n_empty += 1  # kept as zero frames to preserve the regular grid
+            pending.append(build_representation(
+                ex, ey, et, ep, frame_times[i], dt, modality, cfg))
+            if len(pending) == batch_size:
+                flush()
+        if pending:
+            flush()
+
     print(f"  [{name}] {len(frame_times)} frames @ {cfg.datasets.sample_hz} Hz, "
           f"dt={dt}s, {n_empty} empty bins")
 
-    ds = BrisbaneBinDataset((x, y, t, p), frame_times, dt, modality, cfg)
-    loader = DataLoader(ds, batch_size=cfg.datasets.batch_size, shuffle=False,
-                        num_workers=cfg.datasets.num_workers, pin_memory=True)
-    desc = extract_descriptors(model, loader, device)
+    desc = torch.cat(descs, dim=0)
     desc = torch.nn.functional.normalize(desc, p=2, dim=1)
 
     xy = torch.from_numpy(xy).float()
     torch.save({"desc": desc, "xy": xy,
                 "frame_times": torch.from_numpy(frame_times)}, cache)
     return desc, xy
+
 
 def recall_at_1(preds, q_xy, r_xy, threshold):
     err = torch.linalg.norm(q_xy - r_xy[preds], dim=1)
@@ -206,6 +240,7 @@ def recall_at_1(preds, q_xy, r_xy, threshold):
     r1_valid = (100.0 * correct[has_pos].float().mean().item()
                 if has_pos.any() else float("nan"))
     return r1_total, r1_valid, int(has_pos.sum()), len(preds)
+
 
 def build_model(cfg, device):
     # mirrors train.py exactly
@@ -223,6 +258,7 @@ def build_model(cfg, device):
     model.load_state_dict(state)
     return model.to(device)
 
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     device = torch.device(cfg.device)
@@ -232,7 +268,7 @@ def main(cfg: DictConfig):
     queries = [n for n in cfg.datasets.traverses if n != ref_name]
 
     model = build_model(cfg, device)
-    
+
     desc, xy = {}, {}
     for name in cfg.datasets.traverses:
         print(f"Processing {name}")
