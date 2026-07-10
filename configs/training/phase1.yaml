@@ -1,0 +1,12 @@
+# Phase 1: cross-modal distillation on DSEC (cached teacher features).
+
+name: phase1                # goes into run/checkpoint names
+epochs: 30
+batch_size: 32              
+learning_rate: 1.0e-4       # AdamW, full model
+enable_amp: true
+
+# Losses
+attention_guided: true      # AGFD patch loss; false -> plain MSE (cache-once, decide-in-loss)
+structural_loss_weight: 1.0 # relative weight of batch-relational KL vs patch loss
+temperature: 0.05           # softmax temperature for structural KL

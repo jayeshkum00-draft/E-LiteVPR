@@ -1,0 +1,47 @@
+defaults:
+  - model: student_model        # img_hw [384,384], num_patches 576, teacher_dim 1024
+  - _self_
+
+device: cuda
+
+data:
+  modality: histogram           # override: histogram | voxel
+  input_channels: 3
+
+model_weights: /kaggle/working/best_phase1_histogram.pth   # override per run
+
+# directory containing the denoised *.parquet and *.nmea files
+# (searched recursively, so a flat HF download or nested layout both work)
+root: /kaggle/input/brisbane-event-vpr
+
+# traverse name -> recording key used to locate the files.
+traverses:
+  sunset1: 2020-04-21-17-03-03
+  sunset2: 2020-04-22-17-24-21
+  daytime: 2020-04-24-15-12-03
+  morning: 2020-04-28-09-14-11
+  sunrise: 2020-04-29-06-20-23
+  night:   2020-04-27-18-13-29   
+
+reference: sunset1              # paper: sunset1 vs the other five
+
+sensor_hw: [260, 346]           # DAVIS346 (H, W)
+dt: 1.0                         
+sample_hz: 1.0                  
+time_offset: 0.0                # escape hatch if event/GPS clocks disagree
+
+gt_threshold_m: 25.0
+seq_lengths: [1, 10, 20, 30]
+
+# representation parameters — must match DSEC preprocessing
+hot_pixel_threshold: 99.5       # = cfg.datasets.event_hot_pixels_threshold at train time
+voxel_bins: 3                   # = cfg.datasets.event_voxel_bins at train time
+
+lat0: -27.47
+lon0: 152.98
+
+batch_size: 32
+num_workers: 2                  # Kaggle: 4 vCPU
+
+cache_dir: /kaggle/working/brisbane_cache
+results_csv: /kaggle/working/brisbane_results_{modality}_dt{dt}.csv
