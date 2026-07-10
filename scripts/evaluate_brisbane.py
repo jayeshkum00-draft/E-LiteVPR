@@ -133,7 +133,10 @@ def stream_window_events(parquet_path, frame_times, dt, scale, time_offset=0.0,
         bt = np.concatenate((bt, t))
         bp = np.concatenate((bp, p))
 
-        while frame_idx < len(frame_times) and frame_times[frame_idx] + dt <= bt[-1]:
+        # bt can be emptied by the post-emit trim when dt < grid step
+        # (windows are then disjoint); fall through and read the next batch
+        while (frame_idx < len(frame_times) and bt.size > 0
+               and frame_times[frame_idx] + dt <= bt[-1]):
             yield emit(frame_idx)
             frame_idx += 1
             if frame_idx < len(frame_times):
