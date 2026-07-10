@@ -63,6 +63,22 @@ def centre(desc, mean_vec):
     return torch.nn.functional.normalize(desc - mean_vec, p=2, dim=1)
 
 
+def fit_whitener(ref_desc, shrink=0.1):
+    """PCA whitening learned on the reference map only (query-blind, so
+    still zero-shot). shrink regularises small eigenvalues."""
+    mean_vec = ref_desc.mean(dim=0, keepdim=True)
+    X = ref_desc - mean_vec
+    _, s, Vh = torch.linalg.svd(X, full_matrices=False)
+    scale = 1.0 / torch.sqrt(s**2 / (X.shape[0] - 1) + shrink * (s**2).mean()
+                             / (X.shape[0] - 1))
+    W = Vh.T * scale.unsqueeze(0)
+    return mean_vec, W
+
+
+def whiten(desc, mean_vec, W):
+    return torch.nn.functional.normalize((desc - mean_vec) @ W, p=2, dim=1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache_dir", required=True)
@@ -88,20 +104,24 @@ def main():
     ref_mean = desc[REFERENCE].mean(dim=0, keepdim=True)
     r_raw = desc[REFERENCE]
     r_cen = centre(desc[REFERENCE], ref_mean)
+    w_mean, W = fit_whitener(desc[REFERENCE])
+    r_wht = whiten(desc[REFERENCE], w_mean, W)
 
     print(f"\n=== L=1 retrieval vs {REFERENCE} (R@1 @ {THRESHOLD_M:.0f} m; "
           f"best-match error percentiles, metres) ===")
-    print(f"{'query':10s} {'raw R@1':>8s} {'ctr R@1':>8s}   "
-          f"{'raw p25/p50/p75/p90':>24s}   {'ctr p25/p50/p75/p90':>24s}")
+    print(f"{'query':10s} {'raw R@1':>8s} {'ctr R@1':>8s} {'wht R@1':>8s}   "
+          f"{'raw p25/p50/p75/p90':>24s}   {'wht p25/p50/p75/p90':>24s}")
     for name in TRAVERSES:
         if name == REFERENCE:
             continue
         r1, pct = retrieval(desc[name], xy[name], r_raw, xy[REFERENCE])
-        r1c, pctc = retrieval(centre(desc[name], ref_mean), xy[name],
-                              r_cen, xy[REFERENCE])
+        r1c, _ = retrieval(centre(desc[name], ref_mean), xy[name],
+                           r_cen, xy[REFERENCE])
+        r1w, pctw = retrieval(whiten(desc[name], w_mean, W), xy[name],
+                              r_wht, xy[REFERENCE])
         fmt = lambda p: "/".join(f"{v:.0f}" for v in p)
-        print(f"{name:10s} {r1:7.2f}% {r1c:7.2f}%   {fmt(pct):>24s}   "
-              f"{fmt(pctc):>24s}")
+        print(f"{name:10s} {r1:7.2f}% {r1c:7.2f}% {r1w:7.2f}%   "
+              f"{fmt(pct):>24s}   {fmt(pctw):>24s}")
 
         if plt is None:
             continue
