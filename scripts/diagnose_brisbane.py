@@ -79,6 +79,29 @@ def whiten(desc, mean_vec, W):
     return torch.nn.functional.normalize((desc - mean_vec) @ W, p=2, dim=1)
 
 
+def shift_along_track(xy, delta_s, step_s=1.0):
+    """Approximate the position delta_s seconds later along the same
+    trajectory, using finite-difference velocity from the 1 Hz grid."""
+    vel = torch.zeros_like(xy)
+    vel[:-1] = (xy[1:] - xy[:-1]) / step_s
+    vel[-1] = vel[-2]
+    return xy + delta_s * vel
+
+
+def offset_sweep(q_desc, q_xy, r_desc, r_xy, deltas):
+    """R@1 and median best-match error as a function of a time offset
+    applied to the QUERY GPS interpolation. A sharp off-zero optimum means
+    the event and GPS clocks disagree (-> datasets.time_offset)."""
+    pred = (q_desc @ r_desc.T).argmax(dim=1)
+    rows = []
+    for d in deltas:
+        err = torch.linalg.norm(
+            shift_along_track(q_xy, d) - r_xy[pred], dim=1)
+        rows.append((d, 100.0 * (err <= THRESHOLD_M).float().mean().item(),
+                     err.median().item()))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache_dir", required=True)
@@ -123,7 +146,29 @@ def main():
         print(f"{name:10s} {r1:7.2f}% {r1c:7.2f}% {r1w:7.2f}%   "
               f"{fmt(pct):>24s}   {fmt(pctw):>24s}")
 
-        if plt is None:
+    print(f"\n=== query-clock offset sweep (whitened desc; positions shifted "
+          f"delta s along query trajectory) ===")
+    print("A sharp optimum away from 0 = event/GPS clock disagreement for "
+          "that traverse pair -> per-traverse time_offset, NOT a descriptor "
+          "problem.")
+    deltas = [d / 2.0 for d in range(-10, 11)]
+    print(f"{'query':10s} {'R@1(d=0)':>9s} {'best d':>7s} {'R@1(d*)':>8s} "
+          f"{'med_err(d*)':>11s}")
+    for name in TRAVERSES:
+        if name == REFERENCE:
+            continue
+        rows = offset_sweep(whiten(desc[name], w_mean, W), xy[name],
+                            r_wht, xy[REFERENCE], deltas)
+        r1_0 = next(r for r in rows if r[0] == 0.0)[1]
+        d_star, r1_star, med_star = max(rows, key=lambda r: (r[1], -r[2]))
+        print(f"{name:10s} {r1_0:8.2f}% {d_star:6.1f}s {r1_star:7.2f}% "
+              f"{med_star:10.1f}m")
+        if name == "sunset2":
+            curve = "  ".join(f"{d:+.1f}s:{r1:.1f}" for d, r1, _ in rows)
+            print(f"           full curve: {curve}")
+
+    for name in TRAVERSES:
+        if name == REFERENCE or plt is None:
             continue
         sim = (centre(desc[name], ref_mean) @ r_cen.T).numpy()
         fig, ax = plt.subplots(figsize=(6, 5))
