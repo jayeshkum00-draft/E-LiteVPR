@@ -217,7 +217,7 @@ def build_model(cfg, device):
         in_channels=cfg.data.input_channels,
     )
     print(f"Loading weights: {cfg.phase1_weights}")
-    state = torch.load(cfg.model_weights, map_location="cpu")
+    state = torch.load(cfg.phase1_weights, map_location="cpu")
     if isinstance(state, dict) and "model_state" in state:
         state = state["model_state"]   # tolerate a last_*.pth full-state file
     model.load_state_dict(state)
