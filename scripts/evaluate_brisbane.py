@@ -165,9 +165,12 @@ def resolve_file(directory, key, suffix):
 def process_traverse(name, cfg, model, device):
     """-> descriptors (N, D) L2-normalised, positions (N, 2) metres."""
     modality = cfg.data.modality
+    clock_offset = float(cfg.datasets.get("clock_offsets", {}).get(name, 0.0))
     cache_dir = Path(cfg.datasets.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache = cache_dir / f"{name}_{modality}_dt{cfg.datasets.dt}.pt"
+    # clock_offset is in the key: it changes the stored xy
+    cache = (cache_dir /
+             f"{name}_{modality}_dt{cfg.datasets.dt}_co{clock_offset}.pt")
     if cache.exists():
         blob = torch.load(cache, map_location="cpu")
         return blob["desc"], blob["xy"]
@@ -190,12 +193,13 @@ def process_traverse(name, cfg, model, device):
 
     dt = float(cfg.datasets.dt)
     step = 1.0 / float(cfg.datasets.sample_hz)
-    t_start = max(t_min, gps_t[0])
-    t_end = min(t_max - dt, gps_t[-1] - dt)
+    t_start = max(t_min, gps_t[0] - clock_offset)
+    t_end = min(t_max - dt, gps_t[-1] - dt - clock_offset)
     frame_times = np.arange(t_start, t_end, step)
 
     xy_all = latlon_to_xy(lat, lon, float(cfg.datasets.lat0), float(cfg.datasets.lon0))
-    tc = frame_times + dt / 2.0
+    # per-recording event-vs-GPS clock correction (see brisbane.yaml)
+    tc = frame_times + dt / 2.0 + clock_offset
     xy = np.stack([np.interp(tc, gps_t, xy_all[:, 0]),
                    np.interp(tc, gps_t, xy_all[:, 1])], axis=1)
 
