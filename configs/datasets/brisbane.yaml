@@ -22,9 +22,27 @@ traverses:
 reference: sunset1              # paper: sunset1 vs the other five
 
 sensor_hw: [260, 346]           # DAVIS346 (H, W)
-dt: 1.0                         
-sample_hz: 1.0                  
+dt: 1.0
+sample_hz: 1.0
 time_offset: 0.0                # escape hatch if event/GPS clocks disagree
+
+# Per-recording event-vs-GPS clock offset in seconds: GPS is sampled at
+# event_time + offset. Events (ROS host clock) and NMEA (GPS/UTC, logged
+# by the consumer camera) are separate devices; the official alignment is
+# sparse-event-vpr's per-recording video_beginning anchors, where
+# position(event t) = gps_relative(t - video_beginning). Equivalently:
+#   offset = first_RMC_fix_utc - video_beginning
+# Values below are derived from those published anchors; 
+# see - 'https://github.com/Tobias-Fischer/sparse-event-vpr/blob/main/src/sparse_event_vpr/constants.py'
+clock_offsets:
+  sunset1: 0.65                 # 1587452594.0 - 1587452593.35
+  sunset2: 2.35                 # 1587540274.0 - 1587540271.65
+  daytime: 3.20                 # 1587705140.0 - 1587705136.80
+  morning: 7.27                 # 1588029279.0 - 1588029271.73
+  sunrise: 7.09                 # 1588105248.0 - 1588105240.91
+  night:   0.0                  # absent from sparse-event-vpr constants;
+                                # set from the cross-correlation estimate
+                                # (expect ~4.5-7 by the date-drift trend)
 
 gt_threshold_m: 25.0
 seq_lengths: [1, 10, 20, 30]
