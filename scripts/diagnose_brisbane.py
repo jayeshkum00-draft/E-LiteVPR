@@ -32,6 +32,16 @@ TRAVERSES = ["sunset1", "sunset2", "daytime", "morning", "sunrise", "night"]
 REFERENCE = "sunset1"
 THRESHOLD_M = 25.0
 
+# recording keys, mirrors configs/datasets/brisbane.yaml
+KEYS = {
+    "sunset1": "2020-04-21-17-03-03",
+    "sunset2": "2020-04-22-17-24-21",
+    "daytime": "2020-04-24-15-12-03",
+    "morning": "2020-04-28-09-14-11",
+    "sunrise": "2020-04-29-06-20-23",
+    "night":   "2020-04-27-18-13-29",
+}
+
 
 def load_cache(cache_dir, name, modality, dt):
     path = Path(cache_dir) / f"{name}_{modality}_dt{dt}.pt"
@@ -88,6 +98,87 @@ def shift_along_track(xy, delta_s, step_s=1.0):
     return xy + delta_s * vel
 
 
+def _parse_rmc_time_speed(path):
+    """(t_epoch[s], speed[m/s]) from $__RMC sentences (field 7 = knots)."""
+    from datetime import datetime, timezone
+    times, speeds = [], []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            if "RMC" not in line:
+                continue
+            fields = line.strip().split(",")
+            try:
+                if len(fields) < 10 or fields[2] != "A":
+                    continue
+                base = datetime.strptime(
+                    fields[9] + fields[1].split(".")[0], "%d%m%y%H%M%S"
+                ).replace(tzinfo=timezone.utc).timestamp()
+                frac = (float("0." + fields[1].split(".")[1])
+                        if "." in fields[1] else 0.0)
+                speeds.append(float(fields[7]) * 0.514444)
+                times.append(base + frac)
+            except (ValueError, IndexError):
+                continue
+    if not times:
+        raise RuntimeError(f"no RMC speed fixes in {path}")
+    import numpy as np
+    order = np.argsort(times)
+    return (np.asarray(times)[order], np.asarray(speeds)[order])
+
+
+def _event_rate(parquet_path, res):
+    """Event count per `res`-second bin + the bin grid start (epoch s)."""
+    import numpy as np
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(parquet_path)
+    names = {n.lower(): n for n in pf.schema_arrow.names}
+    ct = next(names[c] for c in ("t", "timestamp", "time") if c in names)
+    t_last = float(pf.read_row_group(
+        pf.metadata.num_row_groups - 1, columns=[ct]).column(0)[-1].as_py())
+    scale = 1e-9 if t_last > 1e17 else 1e-6 if t_last > 1e14 else \
+        1e-3 if t_last > 1e11 else 1.0
+    counts, t0 = None, None
+    for rb in pf.iter_batches(batch_size=5_000_000, columns=[ct]):
+        t = rb.column(0).to_numpy(zero_copy_only=False).astype(np.float64) * scale
+        if t0 is None:
+            t0 = t[0]
+        idx = ((t - t0) / res).astype(np.int64)
+        c = np.bincount(idx)
+        if counts is None:
+            counts = c
+        else:
+            if len(c) > len(counts):
+                counts = np.pad(counts, (0, len(c) - len(counts)))
+            counts[:len(c)] += np.pad(c, (0, len(counts) - len(c)))
+    return counts.astype(np.float64), t0
+
+
+def estimate_clock_offset(ev_path, gps_path, res=0.1, max_lag=15.0):
+    """Descriptor-free event/GPS clock offset via cross-correlation of
+    event rate against GPS speed-over-ground. Returns (offset, peak_corr):
+    GPS should be sampled at event_time + offset. Positive offset = event
+    clock behind GPS clock (same sign convention as the retrieval sweep)."""
+    import numpy as np
+    rate, t0 = _event_rate(ev_path, res)
+    gps_t, sp = _parse_rmc_time_speed(gps_path)
+    grid = t0 + np.arange(len(rate)) * res
+    valid = (grid >= gps_t[0] - max_lag) & (grid <= gps_t[-1] + max_lag)
+    a = rate[valid] - rate[valid].mean()
+    g = grid[valid]
+    max_k = int(round(max_lag / res))
+    best = (0.0, -np.inf)
+    for k in range(-max_k, max_k + 1):
+        s = np.interp(g + k * res, gps_t, sp)
+        s = s - s.mean()
+        denom = a.std() * s.std()
+        if denom == 0:
+            continue
+        c = float((a * s).mean() / denom)
+        if c > best[1]:
+            best = (k * res, c)
+    return best
+
+
 def offset_sweep(q_desc, q_xy, r_desc, r_xy, deltas):
     """R@1 and median best-match error as a function of a time offset
     applied to the QUERY GPS interpolation. A sharp off-zero optimum means
@@ -109,10 +200,30 @@ def main():
     ap.add_argument("--dt", required=True,
                     help="as it appears in the cache filename, e.g. 1.0 or 0.05")
     ap.add_argument("--out_dir", default="diagnostics")
+    ap.add_argument("--root", default=None,
+                    help="dataset root with *.parquet/*.nmea; enables the "
+                         "descriptor-free clock-offset estimation")
+    ap.add_argument("--max_lag", type=float, default=15.0)
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.root:
+        print("=== descriptor-free clock offsets: event rate x GPS speed "
+              f"(sample GPS at event_time + offset; lag range +-{args.max_lag:.0f}s) ===")
+        norm = lambda s: s.replace("-", "").replace("_", "")
+        root = Path(args.root)
+        for name in TRAVERSES:
+            find = lambda suf: next(
+                f for f in sorted(root.rglob(f"*{suf}"))
+                if norm(KEYS[name]) in norm(f.name))
+            off, corr = estimate_clock_offset(
+                find(".parquet"), find(".nmea"), max_lag=args.max_lag)
+            flag = "" if corr > 0.3 else "   (weak peak -- treat as unreliable)"
+            print(f"  {name:10s} offset = {off:+5.1f}s   peak_corr = "
+                  f"{corr:.3f}{flag}")
+        print()
 
     desc, xy = {}, {}
     print(f"=== descriptor health [{args.modality}, dt={args.dt}] ===")
@@ -151,7 +262,7 @@ def main():
     print("A sharp optimum away from 0 = event/GPS clock disagreement for "
           "that traverse pair -> per-traverse time_offset, NOT a descriptor "
           "problem.")
-    deltas = [d / 2.0 for d in range(-10, 11)]
+    deltas = [d / 2.0 for d in range(-20, 21)]
     print(f"{'query':10s} {'R@1(d=0)':>9s} {'best d':>7s} {'R@1(d*)':>8s} "
           f"{'med_err(d*)':>11s}")
     for name in TRAVERSES:
