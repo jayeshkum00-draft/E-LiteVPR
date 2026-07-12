@@ -285,23 +285,51 @@ def main(cfg: DictConfig):
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    # stationary-frame removal (standard protocol in the sequence-matching
+    # literature): drop frames below min_speed_ms from BOTH sides before
+    # matching. Both variants are evaluated; 'moving' is the headline,
+    # 'all' is kept for transparency.
+    min_speed = float(cfg.datasets.get("min_speed_ms", 1.0))
+    step = 1.0 / float(cfg.datasets.sample_hz)
+
+    def moving_mask(pos):
+        if len(pos) < 2:
+            return torch.ones(len(pos), dtype=torch.bool)
+        v = torch.linalg.norm(pos[1:] - pos[:-1], dim=1) / step
+        v = torch.cat([v, v[-1:]])
+        return v >= min_speed
+
+    variants = [("all", False)] + ([("moving", True)] if min_speed > 0 else [])
+
     rows = []
-    for q_name in queries:
-        dist = -torch.cdist(desc[q_name].to(device), desc[ref_name].to(device))
-        for length in cfg.datasets.seq_lengths:
-            dist_L = dist if length == 1 else apply_sequence_matching(dist, length)
-            preds = dist_L.argmax(dim=1).cpu()
-            r1, r1_valid, n_valid, n_q = recall_at_1(
-                preds, xy[q_name], xy[ref_name], threshold)
-            cond = "day-day" if q_name in DAY_DAY else "day-night"
-            rows.append(dict(modality=modality, reference=ref_name, query=q_name,
-                             condition=cond, seq_len=length, recall_at_1=r1,
-                             recall_at_1_validonly=r1_valid, n_queries=n_q,
-                             n_queries_with_gt=n_valid,
-                             dt=float(cfg.datasets.dt), threshold_m=threshold))
-            print(f"  {ref_name} vs {q_name:8s} L={length:2d}: R@1={r1:6.2f}%  "
-                  f"(valid-only {r1_valid:6.2f}%, {n_valid}/{n_q} queries "
-                  f"have a {threshold:.0f}m positive)")
+    for variant, filter_stops in variants:
+        keep = {n: (moving_mask(xy[n]) if filter_stops
+                    else torch.ones(len(xy[n]), dtype=torch.bool))
+                for n in cfg.datasets.traverses}
+        if filter_stops:
+            kept = {n: f"{int(k.sum())}/{len(k)}" for n, k in keep.items()}
+            print(f"\n  [moving] frames kept at >= {min_speed} m/s: {kept}")
+        r_desc = desc[ref_name][keep[ref_name]].to(device)
+        r_xy = xy[ref_name][keep[ref_name]]
+        for q_name in queries:
+            q_keep = keep[q_name]
+            dist = -torch.cdist(desc[q_name][q_keep].to(device), r_desc)
+            for length in cfg.datasets.seq_lengths:
+                dist_L = dist if length == 1 else apply_sequence_matching(dist, length)
+                preds = dist_L.argmax(dim=1).cpu()
+                r1, r1_valid, n_valid, n_q = recall_at_1(
+                    preds, xy[q_name][q_keep], r_xy, threshold)
+                cond = "day-day" if q_name in DAY_DAY else "day-night"
+                rows.append(dict(modality=modality, reference=ref_name,
+                                 query=q_name, condition=cond, frames=variant,
+                                 seq_len=length, recall_at_1=r1,
+                                 recall_at_1_validonly=r1_valid, n_queries=n_q,
+                                 n_queries_with_gt=n_valid,
+                                 dt=float(cfg.datasets.dt), threshold_m=threshold))
+                print(f"  [{variant:6s}] {ref_name} vs {q_name:8s} "
+                      f"L={length:2d}: R@1={r1:6.2f}%  "
+                      f"(valid-only {r1_valid:6.2f}%, {n_valid}/{n_q} queries "
+                      f"have a {threshold:.0f}m positive)")
 
     out_csv = Path(str(cfg.datasets.results_csv).format(
         modality=modality, dt=cfg.datasets.dt))
@@ -314,11 +342,14 @@ def main(cfg: DictConfig):
 
     print(f"\n{'='*70}\nSUMMARY [{modality}, dt={cfg.datasets.dt}s] "
           f"(mean over seq lengths > 1)")
-    for cond in ("day-day", "day-night"):
-        vals = [r["recall_at_1"] for r in rows
-                if r["condition"] == cond and r["seq_len"] > 1]
-        if vals:
-            print(f"  {cond:10s}: mean R@1 = {np.mean(vals):.2f}%")
+    for variant, _ in variants:
+        for cond in ("day-day", "day-night"):
+            vals = [r["recall_at_1"] for r in rows
+                    if r["condition"] == cond and r["seq_len"] > 1
+                    and r["frames"] == variant]
+            if vals:
+                print(f"  [{variant:6s}] {cond:10s}: mean R@1 = "
+                      f"{np.mean(vals):.2f}%")
 
 
 if __name__ == "__main__":
