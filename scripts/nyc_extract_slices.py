@@ -200,9 +200,25 @@ def extract_session(sess_dir, label, out_path, cfg_d):
     t_lo, t_hi = centers - half, centers + half
 
     H, W = (int(v) for v in cfg_d.sensor_hw)
-    xs, ys, ts_us, ps = [], [], [], []
     offsets = np.zeros(len(centers) + 1, np.int64)
     n_empty, j = 0, 0
+
+    # slices are streamed to disk as they complete -- a full NYC session
+    # holds ~1e10 events, far beyond RAM
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    o = h5py.File(out_path, "w")
+    ev_ds = {k: o.create_dataset(k, shape=(0,), maxshape=(None,), dtype=dt,
+                                 chunks=(1 << 20,), compression="lzf")
+             for k, dt in [("events_x", np.uint16), ("events_y", np.uint16),
+                           ("events_t_us", np.uint32),
+                           ("events_p", np.uint8)]}
+
+    def append(key, arr):
+        d = ev_ds[key]
+        n0 = d.shape[0]
+        d.resize((n0 + len(arr),))
+        d[n0:] = arr
 
     def emit(j, bx, by, bt, bp):
         a = np.searchsorted(bt, t_lo[j], "left")
@@ -213,10 +229,11 @@ def extract_session(sess_dir, label, out_path, cfg_d):
             offsets[j + 1] = offsets[j]
             return
         ok = (bx[a:b] >= 0) & (bx[a:b] < W) & (by[a:b] >= 0) & (by[a:b] < H)
-        xs.append(bx[a:b][ok].astype(np.uint16))
-        ys.append(by[a:b][ok].astype(np.uint16))
-        ts_us.append(np.round((bt[a:b][ok] - t_lo[j]) * 1e6).astype(np.uint32))
-        ps.append((bp[a:b][ok] > 0).astype(np.uint8))
+        append("events_x", bx[a:b][ok].astype(np.uint16))
+        append("events_y", by[a:b][ok].astype(np.uint16))
+        append("events_t_us",
+               np.round((bt[a:b][ok] - t_lo[j]) * 1e6).astype(np.uint32))
+        append("events_p", (bp[a:b][ok] > 0).astype(np.uint8))
         offsets[j + 1] = offsets[j] + int(ok.sum())
 
     bx = np.empty(0, np.int32); by = np.empty(0, np.int32)
@@ -244,22 +261,16 @@ def extract_session(sess_dir, label, out_path, cfg_d):
     if n_empty:
         print(f"  warning: {n_empty} empty slices")
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(out_path, "w") as o:
-        for k, v in [("events_x", xs), ("events_y", ys),
-                     ("events_t_us", ts_us), ("events_p", ps)]:
-            o.create_dataset(k, data=np.concatenate(v) if v else
-                             np.empty(0, np.uint16), compression="lzf")
-        o.create_dataset("slice_offsets", data=offsets)
-        o.create_dataset("slice_center_ts", data=centers)
-        o.create_dataset("slice_xy_local", data=np.stack([cx, cy], 1))
-        o.create_dataset("slice_xy_map", data=np.stack([cx, cy], 1))
-        o.attrs.update(dict(
-            sequence=Path(sess_dir).name, label=label,
-            slice_ms=float(cfg_d.slice_ms), hz=hz,
-            min_speed=float(cfg_d.min_speed), rectified=False,
-            sensor_hw=(H, W), frame="gps", map_frame="gps"))
+    o.create_dataset("slice_offsets", data=offsets)
+    o.create_dataset("slice_center_ts", data=centers)
+    o.create_dataset("slice_xy_local", data=np.stack([cx, cy], 1))
+    o.create_dataset("slice_xy_map", data=np.stack([cx, cy], 1))
+    o.attrs.update(dict(
+        sequence=Path(sess_dir).name, label=label,
+        slice_ms=float(cfg_d.slice_ms), hz=hz,
+        min_speed=float(cfg_d.min_speed), rectified=False,
+        sensor_hw=(H, W), frame="gps", map_frame="gps"))
+    o.close()
     print(f"  -> {out_path}  ({len(centers)} slices, "
           f"{offsets[-1]/1e6:.1f}M events, "
           f"{out_path.stat().st_size/1e6:.0f} MB)")
