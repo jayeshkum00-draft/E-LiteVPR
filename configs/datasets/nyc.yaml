@@ -12,9 +12,14 @@ sessions:
   sensor_data_2022-12-06_18-27-21: night
   sensor_data_2022-12-06_19-27-59: night
   sensor_data_2022-12-06_20-45-53: night
+  sensor_data_2022-12-07_15-46-32: day
+  sensor_data_2022-12-07_16-52-55: day
+  sensor_data_2022-12-07_17-58-34: day
   sensor_data_2022-12-09_13-59-10: day
+  sensor_data_2022-12-09_14-41-29: day
   sensor_data_2022-12-09_18-56-13: night
   sensor_data_2022-12-09_19-42-07: night
+  sensor_data_2022-12-20_16-54-11: day
   sensor_data_2023-02-14_15-06-30: day
   sensor_data_2023-02-14_18-20-40: night
   sensor_data_2023-04-20_15-53-26: day
