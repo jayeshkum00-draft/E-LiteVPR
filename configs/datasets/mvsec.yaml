@@ -1,0 +1,29 @@
+# MVSEC outdoor slices for Phase 2 triplet training (training-only corpus;
+# see notes -- never used for reported evaluation numbers).
+
+root: /content/drive/MyDrive/E-LiteVPR/MVSEC
+slices_dir: ${.root}/slices
+
+# sequence -> condition subdirectory (also the calib file prefix)
+sequences:
+  outdoor_day1:   outdoor_day
+  outdoor_day2:   outdoor_day
+  outdoor_night1: outdoor_night
+  outdoor_night2: outdoor_night
+  outdoor_night3: outdoor_night
+sequence: all                   # 'all' or a single name from the map above
+
+# --- slice extraction (mvsec_extract_slices.py) ---
+slice_ms: 1200.0                # 1 s max training window + 200 ms jitter margin
+hz: 1.0
+min_speed: 1.0                  # m/s; matches eval stationary-removal threshold
+rectify: true                   # apply official calib maps (DSEC-style input)
+
+# --- triplet mining (phase2_mine_triplets.py) ---
+night_keyword: night
+pos_radius: 25.0                # same-condition positives
+cross_radius: 30.0              # day<->night positives; absorbs ~10-20 m
+                                # cross-sequence registration error
+neg_floor: 150.0                # negatives farther than this (stored for sampler)
+min_dt: 60.0                    # same-sequence positives must differ by > this
+index_out: ${.root}/phase2_index_mvsec.npz
