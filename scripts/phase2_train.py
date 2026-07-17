@@ -60,8 +60,8 @@ def batch_hard_triplet(desc, xy, group, dataset, floor, margin):
     loss_all = F.relu(pos_d - neg_d + margin)[has_neg]
     active = float((loss_all > 0).float().mean()) if len(loss_all) else 0.0
     loss = loss_all.mean() if len(loss_all) else desc.sum() * 0.0
-    return loss, active, float(pos_d.mean()), \
-        float(neg_d[has_neg].mean()) if has_neg.any() else float("nan")
+    return loss, active, float(pos_d.detach().mean()), \
+        float(neg_d[has_neg].detach().mean()) if has_neg.any() else float("nan")
 
 def flatten_batch(batch, device):
     reps = batch["reps"].flatten(0, 1).to(device, non_blocking=True)
