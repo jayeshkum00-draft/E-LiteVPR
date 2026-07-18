@@ -27,3 +27,6 @@ hydra:
 
 # model weights to load for evaluation (overrides the default checkpoint_dir/last_*.pth)
 phase1_weights: /kaggle/working/best_phase1_histogram.pth
+# set to a best_phase2_*.pth to evaluate the Phase 2 model instead
+# (Phase2Net = student + BN/projection head; desc_dim read from checkpoint)
+phase2_weights: null
