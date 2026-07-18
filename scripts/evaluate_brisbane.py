@@ -243,6 +243,23 @@ def process_traverse(name, cfg, model, device, model_tag="phase1"):
     return desc, xy
 
 
+def fit_whitener(ref_desc, shrink=0.1):
+    """PCA whitening learned on the reference map only (query-blind, so
+    still zero-shot). shrink regularises small eigenvalues. Same maths as
+    utils/diagnose_brisbane.py."""
+    mean_vec = ref_desc.mean(dim=0, keepdim=True)
+    X = ref_desc - mean_vec
+    _, s, Vh = torch.linalg.svd(X, full_matrices=False)
+    scale = 1.0 / torch.sqrt(s**2 / (X.shape[0] - 1) + shrink * (s**2).mean()
+                             / (X.shape[0] - 1))
+    W = Vh.T * scale.unsqueeze(0)
+    return mean_vec, W
+
+
+def whiten(desc, mean_vec, W):
+    return torch.nn.functional.normalize((desc - mean_vec) @ W, p=2, dim=1)
+
+
 def recall_at_1(preds, q_xy, r_xy, threshold):
     err = torch.linalg.norm(q_xy - r_xy[preds], dim=1)
     correct = err <= threshold
@@ -305,6 +322,14 @@ def main(cfg: DictConfig):
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    # optional reference-fit PCA whitening (query-blind -> still zero-shot);
+    # applied to all traverses before matching. datasets.whiten=true
+    if bool(cfg.datasets.get("whiten", False)):
+        w_mean, W = fit_whitener(desc[ref_name])
+        desc = {n: whiten(d, w_mean, W) for n, d in desc.items()}
+        print(f"\n  whitening fit on {ref_name} "
+              f"({desc[ref_name].shape[1]} dims), applied to all traverses")
+
     # stationary-frame removal (standard protocol in the sequence-matching
     # literature): drop frames below min_speed_ms from BOTH sides before
     # matching. Both variants are evaluated; 'moving' is the headline,
@@ -353,6 +378,8 @@ def main(cfg: DictConfig):
 
     out_csv = Path(str(cfg.datasets.results_csv).format(
         modality=modality, dt=cfg.datasets.dt))
+    if bool(cfg.datasets.get("whiten", False)):   # don't clobber raw results
+        out_csv = out_csv.with_name(out_csv.stem + "_whitened.csv")
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
