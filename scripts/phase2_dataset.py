@@ -88,7 +88,14 @@ def augment_events(x, y, t_us, p, hw, w_us, rng, aug):
         return x, y, t_us, p
     parts_x, parts_y, parts_t, parts_p = [x], [y], [t_us], [p]
 
-    drop = rng.uniform(0.0, float(aug.drop_max))
+    # darkness simulation: low light collapses signal events while the
+    # noise floor persists -> aggressive signal drop + full-strength BA
+    dark = rng.random() < float(aug.get("dark_p", 0.0))
+    if dark:
+        lo, hi = (float(v) for v in aug.dark_drop)
+        drop = rng.uniform(lo, hi)
+    else:
+        drop = rng.uniform(0.0, float(aug.drop_max))
     if drop > 0 and len(x):
         keep = rng.random(len(x)) >= drop
         parts_x[0], parts_y[0] = x[keep], y[keep]
@@ -97,7 +104,8 @@ def augment_events(x, y, t_us, p, hw, w_us, rng, aug):
     n_px = hw[0] * hw[1]
     w_s = w_us * 1e-6
 
-    n_ba = rng.poisson(rng.uniform(0.0, float(aug.ba_rate_max)) * n_px * w_s)
+    ba_lo = 0.5 * float(aug.ba_rate_max) if dark else 0.0
+    n_ba = rng.poisson(rng.uniform(ba_lo, float(aug.ba_rate_max)) * n_px * w_s)
     if n_ba:
         bx, by, bt, bp = _rand_events(int(n_ba), hw, w_us, rng)
         parts_x.append(bx); parts_y.append(by)
