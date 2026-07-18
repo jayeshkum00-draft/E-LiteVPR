@@ -292,6 +292,12 @@ def build_model(cfg, device):
                     if "head.1.weight" in state else 0)
         net = Phase2Net(model, desc_dim)
         net.load_state_dict(state)
+        if not bool(cfg.get("phase2_use_head", True)):
+            # diagnostic: fine-tuned backbone only, head bypassed -- isolates
+            # whether phase-2 damage lives in the head or the backbone
+            print(f"Loaded Phase 2 weights: {p2} (HEAD BYPASSED: "
+                  "descriptor = student GeM)")
+            return net.student.to(device), "phase2raw"
         print(f"Loaded Phase 2 weights: {p2} (desc_dim={desc_dim or 'raw'})")
         return net.to(device), "phase2"
     print(f"Loading weights: {cfg.phase1_weights}")
