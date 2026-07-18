@@ -30,3 +30,4 @@ phase1_weights: /kaggle/working/best_phase1_histogram.pth
 # set to a best_phase2_*.pth to evaluate the Phase 2 model instead
 # (Phase2Net = student + BN/projection head; desc_dim read from checkpoint)
 phase2_weights: null
+phase2_use_head: true   # false = diagnostic, descriptor from student GeM only
