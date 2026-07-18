@@ -162,15 +162,18 @@ def resolve_file(directory, key, suffix):
     return hits[0]
 
 
-def process_traverse(name, cfg, model, device):
+def process_traverse(name, cfg, model, device, model_tag="phase1"):
     """-> descriptors (N, D) L2-normalised, positions (N, 2) metres."""
     modality = cfg.data.modality
     clock_offset = float(cfg.datasets.get("clock_offsets", {}).get(name, 0.0))
     cache_dir = Path(cfg.datasets.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # clock_offset is in the key: it changes the stored xy
+    # clock_offset is in the key: it changes the stored xy. model_tag keeps
+    # phase2 descriptors from colliding with phase1 caches (phase1 keeps
+    # the historical name so existing caches stay valid).
+    tag = "" if model_tag == "phase1" else f"_{model_tag}"
     cache = (cache_dir /
-             f"{name}_{modality}_dt{cfg.datasets.dt}_co{clock_offset}.pt")
+             f"{name}_{modality}_dt{cfg.datasets.dt}_co{clock_offset}{tag}.pt")
     if cache.exists():
         blob = torch.load(cache, map_location="cpu")
         return blob["desc"], blob["xy"]
@@ -210,7 +213,8 @@ def process_traverse(name, cfg, model, device):
 
     def flush():
         batch = torch.stack(pending).to(device, non_blocking=True)
-        _, d = model(batch)
+        out = model(batch)
+        d = out[1] if isinstance(out, tuple) else out   # student vs Phase2Net
         descs.append(d.float().cpu())
         pending.clear()
 
@@ -250,7 +254,10 @@ def recall_at_1(preds, q_xy, r_xy, threshold):
 
 
 def build_model(cfg, device):
-    # mirrors train.py exactly
+    """(model, tag). Default: Phase 1 student (mirrors train.py exactly).
+    With cfg.phase2_weights set: Phase2Net (student + BN/projection head)
+    from phase2_train, desc_dim inferred from the checkpoint; its forward
+    returns the final normalised descriptor directly."""
     model = EventViTStudent(
         backbone_name=cfg.model.backbone_name,
         teacher_dim=cfg.model.teacher_dim,
@@ -258,12 +265,24 @@ def build_model(cfg, device):
         img_size=cfg.model.img_hw[0],
         in_channels=cfg.data.input_channels,
     )
+    p2 = cfg.get("phase2_weights")
+    if p2:
+        from phase2_train import Phase2Net
+        state = torch.load(p2, map_location="cpu")
+        if isinstance(state, dict) and "model_state" in state:
+            state = state["model_state"]
+        desc_dim = (state["head.1.weight"].shape[0]
+                    if "head.1.weight" in state else 0)
+        net = Phase2Net(model, desc_dim)
+        net.load_state_dict(state)
+        print(f"Loaded Phase 2 weights: {p2} (desc_dim={desc_dim or 'raw'})")
+        return net.to(device), "phase2"
     print(f"Loading weights: {cfg.phase1_weights}")
     state = torch.load(cfg.phase1_weights, map_location="cpu")
     if isinstance(state, dict) and "model_state" in state:
         state = state["model_state"]   # tolerate a last_*.pth full-state file
     model.load_state_dict(state)
-    return model.to(device)
+    return model.to(device), "phase1"
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
@@ -274,12 +293,13 @@ def main(cfg: DictConfig):
     ref_name = cfg.datasets.reference
     queries = [n for n in cfg.datasets.traverses if n != ref_name]
 
-    model = build_model(cfg, device)
+    model, model_tag = build_model(cfg, device)
 
     desc, xy = {}, {}
     for name in cfg.datasets.traverses:
         print(f"Processing {name}")
-        desc[name], xy[name] = process_traverse(name, cfg, model, device)
+        desc[name], xy[name] = process_traverse(name, cfg, model, device,
+                                                model_tag)
 
     del model
     if device.type == "cuda":
