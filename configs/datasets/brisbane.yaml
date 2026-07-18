@@ -49,6 +49,11 @@ clock_offsets:
                                 # Confirm k with the diagnose offset sweep on
                                 # phase2 night descriptors, then finalise.
 
+whiten: false                   # PCA whitening fit on the reference map only
+                                # (query-blind -> still zero-shot); override
+                                # datasets.whiten=true. Results go to a
+                                # *_whitened.csv so raw results are kept.
+
 gt_threshold_m: 25.0
 seq_lengths: [1, 10, 20, 30]
 min_speed_ms: 1.0               # stationary-frame removal threshold (m/s);
