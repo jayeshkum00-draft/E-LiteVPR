@@ -27,13 +27,23 @@ from model import EventViTStudent
 from phase2_dataset import Phase2PairDataset, Phase2ProbeDataset
 
 class Phase2Net(nn.Module):
-    """Student + optional linear projection head -> normalised descriptor."""
+    """Student + descriptor head -> normalised descriptor.
+
+    The BatchNorm is load-bearing: Phase 1 descriptors share a dominant
+    common component (cos_mean ~0.98), and both the raw GeM output and a
+    random linear projection of it stay collapsed, stalling the triplet
+    loss at the margin (verified in the first two Phase 2 runs). BN's
+    per-dimension centering removes the common component and rescales the
+    informative residual to unit variance, so training starts from a
+    spread embedding. Inference uses BN running stats (deterministic)."""
 
     def __init__(self, student, desc_dim=0):
         super().__init__()
         self.student = student
-        self.head = nn.Linear(student.teacher_dim, desc_dim) if desc_dim \
-            else nn.Identity()
+        layers = [nn.BatchNorm1d(student.teacher_dim)]
+        if desc_dim:
+            layers.append(nn.Linear(student.teacher_dim, desc_dim))
+        self.head = nn.Sequential(*layers)
 
     def forward(self, x):
         _, g = self.student(x)
