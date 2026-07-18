@@ -82,18 +82,24 @@ def flatten_batch(batch, device):
     return reps, xy, group, dataset, floor
 
 @torch.no_grad()
-def run_probe(model, probe, device, batch_size, num_workers):
+def run_probe(model, probe, device, batch_size, num_workers, use_head=True):
+    """Probe R@1 with the head descriptor (use_head=True) or the backbone
+    GeM descriptor (use_head=False -- what we deploy; the head is a
+    training-time device a la SimCLR projection heads)."""
     model.eval()
     loader = DataLoader(probe, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=True)
-    desc = torch.empty(len(probe), 0)
     outs = [None] * len(probe)
     for reps, idx in tqdm(loader, desc="Probe"):
-        d = model(reps.to(device, non_blocking=True)).cpu()
+        reps = reps.to(device, non_blocking=True)
+        if use_head:
+            d = model(reps).cpu()
+        else:
+            _, g = model.student(reps)
+            d = F.normalize(g, p=2, dim=-1).cpu()
         for k, i in enumerate(idx.tolist()):
             outs[i] = d[k]
-    desc = torch.stack(outs)
-    return probe.recall_at_1(desc)
+    return probe.recall_at_1(torch.stack(outs))
 
 def save_checkpoint(path, model, optimizer, scaler, epoch, best_r1,
                     patience, run_id, cfg):
@@ -176,7 +182,16 @@ def main(cfg: DictConfig):
             "the distilled student (set phase1_weights=... to override)")
     model = Phase2Net(student, int(t_cfg.desc_dim)).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=t_cfg.learning_rate)
+    # differential lrs: the head must learn fast (it is new and does the
+    # de-collapsing); the backbone carries Phase 1 semantics and is
+    # protected (prior submission: global 1e-4 crashed Phase 1 knowledge)
+    lr_bb = float(t_cfg.get("lr_backbone", t_cfg.get("learning_rate", 5e-5)))
+    lr_hd = float(t_cfg.get("lr_head", lr_bb))
+    optimizer = optim.AdamW([
+        {"params": model.student.parameters(), "lr": lr_bb},
+        {"params": model.head.parameters(), "lr": lr_hd},
+    ])
+    print(f"lr backbone {lr_bb:g}, head {lr_hd:g}")
 
     start_epoch, best_r1, patience = 0, -1.0, 0
     if resume:
@@ -190,9 +205,12 @@ def main(cfg: DictConfig):
         patience = ckpt["patience_counter"]
         print(f"Resumed at epoch {start_epoch} (best_val_r1={best_r1:.4f})")
 
-    r1_0 = run_probe(model, probe, device, t_cfg.batch_size, cfg.num_workers)
-    print(f"Probe R@1 before training: {r1_0:.4f}")
-    wandb.log({"epoch": start_epoch, "val_probe_r1": r1_0})
+    r1h = run_probe(model, probe, device, t_cfg.batch_size, cfg.num_workers)
+    r1g = run_probe(model, probe, device, t_cfg.batch_size, cfg.num_workers,
+                    use_head=False)
+    print(f"Probe R@1 before training: head {r1h:.4f}, gem {r1g:.4f}")
+    wandb.log({"epoch": start_epoch, "val_probe_r1": r1h,
+               "val_probe_r1_gem": r1g})
 
     for epoch in range(start_epoch, t_cfg.epochs):
         print(f"\nEpoch {epoch + 1}/{t_cfg.epochs}")
@@ -229,19 +247,23 @@ def main(cfg: DictConfig):
                              pos=f"{pd:.3f}", neg=f"{nd:.3f}")
 
         tr = totals / max(n_b, 1)
+        r1h = run_probe(model, probe, device, t_cfg.batch_size,
+                        cfg.num_workers)
         r1 = run_probe(model, probe, device, t_cfg.batch_size,
-                       cfg.num_workers)
+                       cfg.num_workers, use_head=False)   # selection metric
         print(f"Epoch {epoch + 1} - loss {tr[0]:.4f}, active {tr[1]:.2f}, "
-              f"pos_d {tr[2]:.3f}, neg_d {tr[3]:.3f}, probe R@1 {r1:.4f}")
+              f"pos_d {tr[2]:.3f}, neg_d {tr[3]:.3f}, "
+              f"probe R@1 head {r1h:.4f} / gem {r1:.4f}")
         wandb.log({"epoch": epoch + 1, "train_loss": tr[0],
                    "active_triplets": tr[1], "pos_dist": tr[2],
-                   "neg_dist": tr[3], "val_probe_r1": r1,
+                   "neg_dist": tr[3], "val_probe_r1": r1h,
+                   "val_probe_r1_gem": r1,
                    "cross_pair_frac": cross_frac / max(n_b, 1)})
 
         if r1 > best_r1:
             best_r1, patience = r1, 0
             torch.save(model.state_dict(), best_path)
-            print(f"New best probe R@1: {r1:.4f} -> {best_path}")
+            print(f"New best GEM probe R@1: {r1:.4f} -> {best_path}")
         else:
             patience += 1
         save_checkpoint(last_path, model, optimizer, scaler, epoch,
