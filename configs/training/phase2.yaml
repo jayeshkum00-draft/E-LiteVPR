@@ -1,0 +1,32 @@
+# Phase 2: GPS-triplet metric learning on MVSEC + NYC, init from Phase 1.
+
+name: phase2
+epochs: 40
+batch_size: 24              # anchor-positive PAIRS per batch (48 images)
+lr_backbone: 1.0e-5         # protects Phase 1 semantics (round 1's global
+                            # 5e-5 mildly eroded night long-seq transfer;
+                            # prior submission: 1e-4 crashed Phase 1)
+lr_head: 1.0e-4             # head is new, learns fast; discarded at deploy
+enable_amp: true
+
+margin: 0.2                 # triplet margin on L2-normalised descriptors
+desc_dim: 0                 # 0 = raw GeM descriptor (teacher_dim); >0 adds a
+                            # linear projection head trained from scratch
+window_ms: 50.0             # training window cut from stored slices
+cross_quota: 0.5            # P(sample a cross-condition positive | available)
+night_balance: true         # WeightedRandomSampler day/night on anchors
+steps_per_epoch: 500        # anchors drawn per epoch = steps * batch_size
+
+# noise domain randomization (bridges IMX636 -> DAVIS346 sensor gap);
+# ranges are per-sample uniform draws, applied before hot-pixel masking
+aug:
+  drop_max: 0.4             # random event drop fraction in [0, drop_max]
+  dark_p: 0.25              # P(darkness simulation): signal collapses,
+  dark_drop: [0.5, 0.9]     # ...drop fraction range, with BA noise held
+                            # at >= half its max rate (low-light regime)
+  ba_rate_max: 5.0          # background-activity noise, Hz/pixel in [0, max]
+  hot_pixels_max: 8         # injected hot pixels, count in [0, max]
+  hot_rate: [200.0, 2000.0] # per injected pixel, Hz
+  flicker_p: 0.3            # P(add 50/60 Hz mains flicker)
+  flicker_rate_max: 10.0    # flicker events, Hz/pixel during on-phase
+  flicker_freq: [100.0, 120.0]   # burst frequency = 2x mains

@@ -1,0 +1,33 @@
+defaults:
+  - datasets: dsec
+  - model: student_model    # extraction script: run with `model=teacher_model`
+  - training: phase1
+  - _self_
+
+seed: 42
+device: cuda                
+num_workers: 2              # Kaggle gives 4 vCPUs; 12 oversubscribes and slows the loader
+project_name: E-LiteVPR
+
+# Event input (which pairs.txt column + student input channels)
+data:
+  modality: histogram       # 'histogram' or 'voxel'
+  input_channels: 3         # preprocessed events are stored (3, H, W) for both modalities
+
+# Checkpointing / resume
+checkpoint_dir: /kaggle/working/checkpoints   # must live under /kaggle/working to survive as notebook output
+resume: true                # auto-resume from last_*.pth if present
+early_stopping: 10
+
+output_dir: /content/outputs
+
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# model weights to load for evaluation (overrides the default checkpoint_dir/last_*.pth)
+phase1_weights: /kaggle/working/best_phase1_histogram.pth
+# set to a best_phase2_*.pth to evaluate the Phase 2 model instead
+# (Phase2Net = student + BN/projection head; desc_dim read from checkpoint)
+phase2_weights: null
+phase2_use_head: true   # false = diagnostic, descriptor from student GeM only
