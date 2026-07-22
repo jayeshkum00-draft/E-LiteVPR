@@ -8,10 +8,11 @@ import numpy as np
 import torch
 
 def _accumulate_events(x, y, sensor_hw):
+    # per-pixel event count. np.bincount (C-level) is ~10-50x faster than
+    # np.add.at and produces bit-identical counts.
     h, w = sensor_hw
-    hist = np.zeros((h, w), dtype=np.float32)
-    np.add.at(hist, (y, x), 1)
-    return hist
+    lin = y.astype(np.int64) * w + x.astype(np.int64)
+    return np.bincount(lin, minlength=h * w).astype(np.float32).reshape(h, w)
 
 def compute_hot_pixel_mask(x_r, y_r, sensor_hw, threshold=99.5):
     h, w = sensor_hw
