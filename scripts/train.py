@@ -35,7 +35,7 @@ def compute_structural_loss(student_global, teacher_global, temperature=0.05):
 
 
 def compute_losses(model_out, teacher_patches, teacher_attn, teacher_gem,
-                   use_agfd, structural_weight, temperature):
+                   use_agfd, structural_weight, temperature, patch_weight=1.0):
     student_patches, student_global = model_out
 
     with torch.no_grad():
@@ -47,7 +47,8 @@ def compute_losses(model_out, teacher_patches, teacher_attn, teacher_gem,
         patch_loss = F.mse_loss(student_patches, teacher_patches)
 
     structural_loss = compute_structural_loss(student_global, teacher_global, temperature)
-    loss = patch_loss + structural_weight * structural_loss
+    # patch_weight=0 -> structural-only; structural_weight=0 -> patch-only (AGFD or MSE)
+    loss = patch_weight * patch_loss + structural_weight * structural_loss
     return loss, patch_loss, structural_loss
 
 # Day/night weighted sampler
@@ -107,7 +108,8 @@ def load_checkpoint(path, model, optimizer, scaler, device):
     return ckpt
 
 def train_epoch(model, dataloader, optimizer, scaler, teacher_gem,
-                use_agfd, structural_weight, temperature, device, enable_amp):
+                use_agfd, structural_weight, temperature, device, enable_amp,
+                patch_weight=1.0):
     model.train()
     teacher_gem.eval()
 
@@ -126,7 +128,7 @@ def train_epoch(model, dataloader, optimizer, scaler, teacher_gem,
             model_out = model(images)
             loss, patch_loss, structural_loss = compute_losses(
                 model_out, teacher_patches, teacher_attn, teacher_gem,
-                use_agfd, structural_weight, temperature)
+                use_agfd, structural_weight, temperature, patch_weight)
 
         if not torch.isfinite(loss):
             raise RuntimeError(
@@ -160,7 +162,8 @@ def train_epoch(model, dataloader, optimizer, scaler, teacher_gem,
 
 @torch.no_grad()
 def validate_epoch(model, dataloader, teacher_gem,
-                   use_agfd, structural_weight, temperature, device):
+                   use_agfd, structural_weight, temperature, device,
+                   patch_weight=1.0):
     model.eval()
     teacher_gem.eval()
 
@@ -175,7 +178,7 @@ def validate_epoch(model, dataloader, teacher_gem,
         model_out = model(images)
         loss, patch_loss, structural_loss = compute_losses(
             model_out, teacher_patches, teacher_attn, teacher_gem,
-            use_agfd, structural_weight, temperature)
+            use_agfd, structural_weight, temperature, patch_weight)
 
         totals += torch.tensor([loss.item(), patch_loss.item(), structural_loss.item()])
         num_batches += 1
@@ -310,12 +313,14 @@ def main(cfg: DictConfig):
         train_loss, train_patch, train_struct = train_epoch(
             model, train_dataloader, optimizer, scaler, teacher_gem,
             cfg.training.attention_guided, cfg.training.structural_loss_weight,
-            cfg.training.temperature, device, enable_amp)
+            cfg.training.temperature, device, enable_amp,
+            patch_weight=cfg.training.get('patch_loss_weight', 1.0))
 
         val_loss, val_patch, val_struct = validate_epoch(
             model, val_dataloader, teacher_gem,
             cfg.training.attention_guided, cfg.training.structural_loss_weight,
-            cfg.training.temperature, device)
+            cfg.training.temperature, device,
+            patch_weight=cfg.training.get('patch_loss_weight', 1.0))
 
         print(f"Epoch {epoch + 1} - Train Loss: {train_loss:.6f} "
               f"(patch: {train_patch:.6f}, struct: {train_struct:.6f})")
