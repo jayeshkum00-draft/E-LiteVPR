@@ -9,4 +9,5 @@ enable_amp: true
 # Losses
 attention_guided: true      # AGFD patch loss; false -> plain MSE (cache-once, decide-in-loss)
 structural_loss_weight: 1.0 # relative weight of batch-relational KL vs patch loss
+patch_loss_weight: 1.0      # weight on the patch term; 0 -> structural-only ablation
 temperature: 0.05           # softmax temperature for structural KL
