@@ -178,12 +178,20 @@ def process_event_histogram(x_r, y_r, p, hot_mask, out_size, sensor_hw=(480, 640
 
     return np.stack([pos_hist, neg_hist, net_hist], axis=0)  # shape: (3, H_out, W_out)
 
-def process_event_time_surface(x_r, y_r, p, t, t_end_us, hot_mask, out_size,
-                               decay_us=10000.0, sensor_hw=(480, 640)):
+def process_event_time_surface(x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size,
+                               decay_frac=1.0, sensor_hw=(480, 640)):
     """
     Per-polarity exponential-decay time surface, evaluated at the window end
     t_end_us (not the last event time -- keeps the reference consistent with
     the histogram/voxel windowing).
+
+    decay_us = decay_frac * (t_end_us - t_start_us): tying the decay constant
+    to the TRUE window span (same span histogram/voxel already integrate over)
+    means the earliest event in the window always keeps a visible weight
+    (exp(-1/decay_frac)), instead of a fixed microsecond constant that would
+    silently discard most of the window if the window is longer than it, or
+    degenerate into a near-binary presence mask if much shorter. decay_frac=1.0
+    -> earliest event weight ~= 0.37, latest ~= 1.0.
 
     Returns (on_surface, off_surface): each (H_out, W_out) float32 in [0, 1],
     1.0 = an event of that polarity fired exactly at t_end_us, decaying
@@ -193,6 +201,9 @@ def process_event_time_surface(x_r, y_r, p, t, t_end_us, hot_mask, out_size,
     fancy-index assignment keeps the LAST (most recent) timestamp per pixel.
     """
     h, w = sensor_hw
+    span_us = float(t_end_us - t_start_us)
+    decay_us = decay_frac * span_us
+
     memory = np.full((2, h, w), -np.inf, dtype=np.float64)  # [OFF, ON]
     memory[p, y_r, x_r] = t.astype(np.float64)
 
@@ -344,8 +355,8 @@ def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, prep
                                                                 num_bins=cfg.datasets.event_voxel_bins,
                                                                 sensor_hw=cfg.datasets.SENSOR_HW)
             on_surface, off_surface = process_event_time_surface(
-                x_r, y_r, p, t, t_end_us, hot_mask, out_size=out_size,
-                decay_us=cfg.datasets.event_timesurface_decay_us,
+                x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size=out_size,
+                decay_frac=cfg.datasets.event_timesurface_decay_frac,
                 sensor_hw=cfg.datasets.SENSOR_HW)
             net_surface = on_surface - off_surface
             zero_surface = np.zeros_like(on_surface)
