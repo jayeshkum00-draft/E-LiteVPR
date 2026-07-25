@@ -1,7 +1,8 @@
 SENSOR_HW: [480, 640]
 event_voxel_bins: 3
 event_hot_pixels_threshold: 99.5
-event_timesurface_decay_us: 10000.0  # tau for timesurface_net/timesurface_zero, microseconds
+event_timesurface_decay_frac: 1.0  # tau = this * window span (t_end_us - t_start_us);
+                                    # 1.0 -> earliest event in window keeps weight exp(-1)~=0.37
 stride: 4 # preprocessing
 
 pair_stride: 1 # train
