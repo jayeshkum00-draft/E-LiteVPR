@@ -21,6 +21,9 @@ early_stopping: 10
 
 output_dir: /content/outputs
 
+# raw DSEC root (RGB/Events/Calibrations subdirs); used by utils/preprocess_dsec*.py
+dsec_path: /placeholder/for/dsec_path
+
 hydra:
   run:
     dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
