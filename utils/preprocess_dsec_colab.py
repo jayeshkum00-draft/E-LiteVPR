@@ -129,8 +129,8 @@ def self_test():
     # res (out_size=(w,h)) so pixel indices are exact, same as the histogram
     # check above.
     on_full, off_full = process_event_time_surface(
-        x_r, y_r, p_r, t_r, t_end_us=50000, hot_mask=hot, out_size=(w, h),
-        decay_us=10000.0, sensor_hw=sensor_hw)
+        x_r, y_r, p_r, t_r, t_start_us=0, t_end_us=50000, hot_mask=hot, out_size=(w, h),
+        decay_frac=1.0, sensor_hw=sensor_hw)
     assert on_full.shape == (h, w) == off_full.shape, \
         f"SELF-TEST FAIL: time surface shape {on_full.shape}"
     assert on_full.min() >= 0.0 and on_full.max() <= 1.0 + 1e-6, \
