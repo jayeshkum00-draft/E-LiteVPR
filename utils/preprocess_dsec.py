@@ -96,7 +96,7 @@ def _norm_unit_max(arr):
     return arr / m if m > 0 else arr
 
 def _resize_to(arr, out_size):
-    # out_size is (W, H) order for cv2.resize; we pass square cfg.image_size
+    # out_size is (W, H) order for cv2.resize; we pass square cfg.model.img_hw
     # so order is moot, but keep the convention explicit.
     return cv2.resize(arr, (out_size[0], out_size[1]), interpolation=cv2.INTER_AREA)
 
@@ -263,7 +263,7 @@ def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, prep
     seq_calib_file = calibrations_dir / seq / "cam_to_cam.yaml"
     seq_pairs_file = pairs_dir / f"{seq}_pairs.txt"
 
-    out_size = tuple(cfg.image_size)  # (W, H) for cv2.resize
+    out_size = tuple(cfg.model.img_hw)  # (W, H) for cv2.resize
     frame_stride = int(cfg.datasets.stride)
     assert frame_stride >= 1, "frame_stride must be >= 1"
 
@@ -338,7 +338,7 @@ def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, prep
             hot_mask = compute_hot_pixel_mask(x_r, y_r, sensor_hw=(480, 640), 
                                               threshold=cfg.datasets.event_hot_pixels_threshold)
             
-            rgb_processed = process_rgb_image(seq_rgb_images[i], K_rect_event, K_rect_rgb, image_size=cfg.image_size)
+            rgb_processed = process_rgb_image(seq_rgb_images[i], K_rect_event, K_rect_rgb, image_size=cfg.model.img_hw)
             event_histogram_processed = process_event_histogram(x_r, y_r, p, hot_mask, out_size=out_size, sensor_hw=cfg.datasets.SENSOR_HW)
             event_voxel_processed = process_event_voxel_grid(x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size=out_size,
                                                                 num_bins=cfg.datasets.event_voxel_bins,
