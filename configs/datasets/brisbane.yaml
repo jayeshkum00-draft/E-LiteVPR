@@ -1,7 +1,8 @@
 device: cuda
 
 data:
-  modality: histogram           # override: histogram | voxel
+  modality: histogram           # override: histogram | voxel |
+                                # timesurface_net | timesurface_zero
   input_channels: 3
 
 model_weights: /kaggle/working/best_phase1_histogram.pth   # override per run
@@ -60,6 +61,8 @@ min_speed_ms: 1.0               # stationary-frame removal threshold (m/s);
 # representation parameters — must match DSEC preprocessing
 hot_pixel_threshold: 99.5       # = cfg.datasets.event_hot_pixels_threshold at train time
 voxel_bins: 3                   # = cfg.datasets.event_voxel_bins at train time
+timesurface_decay_frac: 1.0     # = cfg.datasets.event_timesurface_decay_frac at
+                                # train time; tau = frac * window span (= dt)
 
 lat0: -27.47
 lon0: 152.98
