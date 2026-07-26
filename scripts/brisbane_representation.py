@@ -59,6 +59,33 @@ def process_event_histogram(x_r, y_r, p, hot_mask, out_size, sensor_hw):
     return np.stack([pos_hist, neg_hist, net_hist], axis=0)
 
 
+def process_event_time_surface(x_r, y_r, p, t_us, t_start_us, t_end_us,
+                               hot_mask, out_size, decay_frac, sensor_hw):
+    """Per-polarity exponential-decay time surface evaluated at the window end
+    t_end_us; decay_us = decay_frac * (t_end_us - t_start_us), so the earliest
+    event in the window keeps weight exp(-1/decay_frac). Returns
+    (on_surface, off_surface), each (H_out, W_out) float32 in [0, 1]; pixels
+    with no event of that polarity are exactly 0. Events must be time-sorted
+    ascending -- fancy-index assignment keeps the LAST timestamp per pixel."""
+    h, w = sensor_hw
+    span_us = float(t_end_us - t_start_us)
+    decay_us = decay_frac * span_us
+
+    memory = np.full((2, h, w), -np.inf, dtype=np.float64)  # [OFF, ON]
+    memory[p, y_r, x_r] = t_us.astype(np.float64)
+
+    surface = np.exp((memory - t_end_us) / decay_us)  # -inf -> 0
+    off_surface, on_surface = surface[0], surface[1]
+
+    on_surface[hot_mask] = 0
+    off_surface[hot_mask] = 0
+
+    on_surface = _resize_to(on_surface.astype(np.float32), out_size)
+    off_surface = _resize_to(off_surface.astype(np.float32), out_size)
+
+    return on_surface, off_surface
+
+
 def process_event_voxel_grid(x_r, y_r, p, t_us, t_start_us, t_end_us,
                              hot_mask, out_size, num_bins, sensor_hw):
     """num_bins temporal bins over the TRUE window [t_start_us, t_end_us];
@@ -120,6 +147,16 @@ def build_representation(x, y, t, p, t0, dt, modality, cfg):
         rep = process_event_voxel_grid(
             x, y, p, t_us, 0, t_end_us, hot_mask, out_size,
             num_bins=int(cfg.datasets.voxel_bins), sensor_hw=sensor_hw)
+    elif modality in ("timesurface_net", "timesurface_zero"):
+        # channel packing identical to DSEC preprocessing: net/zero are built
+        # from the ALREADY-RESIZED on/off surfaces, not before the resize.
+        on_surface, off_surface = process_event_time_surface(
+            x, y, p, t_us, 0, t_end_us, hot_mask, out_size,
+            decay_frac=float(cfg.datasets.timesurface_decay_frac),
+            sensor_hw=sensor_hw)
+        third = (on_surface - off_surface if modality == "timesurface_net"
+                 else np.zeros_like(on_surface))
+        rep = np.stack([on_surface, off_surface, third], axis=0)
     else:
         raise ValueError(f"Unknown modality {modality!r}")
 
