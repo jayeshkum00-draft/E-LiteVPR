@@ -207,14 +207,18 @@ def load_recording(h5_path):
 
 
 def _passes_exposure(frame8, cfg):
-    """Reject clearly over/under-exposed frames: mean intensity outside
-    [exposure_min_mean, exposure_max_mean], or too large a fraction of
-    near-clipped pixels (<=1 or >=254 in the 8-bit domain)."""
+    """Reject over/under-exposed frames: mean intensity outside
+    [exposure_min_mean, exposure_max_mean], or too many clipped pixels.
+    Dark (<=1) and bright (>=254) clipping have separate budgets: clipped
+    sky on a bright day still leaves a teacher-visible road scene, while a
+    mostly-black night frame gives the teacher nothing to encode (see
+    ddd20.yaml for the tuning rationale)."""
     mean_val = float(frame8.mean())
     if mean_val < cfg.exposure_min_mean or mean_val > cfg.exposure_max_mean:
         return False
-    saturated = (frame8 <= 1) | (frame8 >= 254)
-    if float(saturated.mean()) > cfg.exposure_max_saturated_frac:
+    if float((frame8 <= 1).mean()) > cfg.exposure_max_dark_frac:
+        return False
+    if float((frame8 >= 254).mean()) > cfg.exposure_max_bright_frac:
         return False
     return True
 
