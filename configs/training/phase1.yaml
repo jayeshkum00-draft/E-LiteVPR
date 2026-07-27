@@ -2,8 +2,12 @@
 
 name: phase1                # goes into run/checkpoint names
 epochs: 30
-batch_size: 32              
-learning_rate: 1.0e-4       # AdamW, full model
+batch_size: 32
+learning_rate: 1.0e-4       # AdamW, full model -- at batch_size == lr_base_batch_size
+lr_base_batch_size: 32      # reference batch size learning_rate was tuned at;
+                            # train.py scales lr by sqrt(batch_size / lr_base_batch_size)
+                            # (sqrt, not linear, since AdamW's own scaling already absorbs
+                            # some of the batch-size effect -- linear tends to overshoot)
 enable_amp: true
 
 # Losses
