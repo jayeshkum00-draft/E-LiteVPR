@@ -1,0 +1,20 @@
+# DDD20 (DAVIS346, ddd20-utils raw hdf5 recordings) preprocessing config.
+# Single DAVIS chip -- APS and DVS share one pixel array, so (unlike DSEC)
+# there is no separate RGB camera, no calibration, and no rectification step.
+SENSOR_HW: [260, 346]              # DAVIS346 (H, W)
+event_voxel_bins: 3
+event_hot_pixels_threshold: 99.5
+event_timesurface_decay_frac: 1.0  # tau = this * window span (t_end_us - t_start_us)
+
+target_hz: 1.0                     # APS subsampling rate (time-based, not index-based)
+event_window_ms: 50                # per kept frame, events in [t_frame - window, t_frame]
+
+# APS exposure filter (0-255 domain, after the 16-bit -> 8-bit >>8 conversion
+# ddd20-utils' own export.py uses). Frames outside this band, or with too many
+# clipped pixels, are skipped -- the next candidate frame is tried instead
+# (does not reset the 1 Hz clock).
+exposure_min_mean: 10
+exposure_max_mean: 245
+exposure_max_saturated_frac: 0.2
+
+ddd20_path: '/placeholder/for/ddd20_path'   # dir of recXXXXXXXXXX.hdf5 files
