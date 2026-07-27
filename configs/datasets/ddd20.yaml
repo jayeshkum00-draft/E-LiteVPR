@@ -13,8 +13,16 @@ event_window_ms: 50                # per kept frame, events in [t_frame - window
 # ddd20-utils' own export.py uses). Frames outside this band, or with too many
 # clipped pixels, are skipped -- the next candidate frame is tried instead
 # (does not reset the 1 Hz clock).
+# Dark/bright clipping have SEPARATE budgets (tuned on real DDD20 diagnostics,
+# 2026-07-27): a fully clipped-white sky is normal for a DAVIS aimed at a
+# bright horizon and the road scene below is still teacher-visible (hi-clip
+# medians 0.39-0.58 on good highway recordings), so the bright budget is
+# loose. A mostly clipped-black frame (rural night, lo-clip ~0.8) carries no
+# teacher-visible content -- distilling against it teaches the student the
+# wrong target -- so the dark budget is tight.
 exposure_min_mean: 10
 exposure_max_mean: 245
-exposure_max_saturated_frac: 0.2
+exposure_max_dark_frac: 0.60      # fraction of pixels <= 1
+exposure_max_bright_frac: 0.75    # fraction of pixels >= 254
 
 ddd20_path: '/placeholder/for/ddd20_path'   # dir of recXXXXXXXXXX.hdf5 files
