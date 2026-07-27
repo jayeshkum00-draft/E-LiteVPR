@@ -342,7 +342,12 @@ def main(cfg: DictConfig):
     for param in teacher_gem.parameters():
         param.requires_grad = False
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.training.learning_rate)
+    lr_base_batch_size = cfg.training.get('lr_base_batch_size', cfg.training.batch_size)
+    scaled_lr = cfg.training.learning_rate * (cfg.training.batch_size / lr_base_batch_size) ** 0.5
+    if scaled_lr != cfg.training.learning_rate:
+        print(f"Scaling lr {cfg.training.learning_rate:.6g} -> {scaled_lr:.6g} "
+              f"(batch_size={cfg.training.batch_size}, lr_base_batch_size={lr_base_batch_size})")
+    optimizer = optim.AdamW(model.parameters(), lr=scaled_lr)
 
     start_epoch = 0
     best_val_loss = float('inf')
