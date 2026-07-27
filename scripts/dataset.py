@@ -1,9 +1,10 @@
+from collections import Counter
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 # Column index as per the pairs.txt line
 # (0 = timestamp, 1 = rgb)
@@ -37,8 +38,23 @@ class E_LiteVPRDataset(Dataset):
 
         pairs_file = self.root / 'pairs.txt'
         if not pairs_file.is_file():
+            # The preprocessing scripts write per-sequence pairs files as they
+            # go and the master only at the very end, so a master-less root
+            # almost always means an interrupted preprocessing run rather than
+            # a wrong path. Say so instead of just "not found".
+            per_seq = sorted(self.root.glob('pairs_*/*_pairs.txt'))
+            hint = ""
+            if per_seq:
+                hint = (
+                    f" Found {len(per_seq)} per-sequence pairs files under "
+                    f"{self.root}/pairs_*/ but no master: that preprocessing run "
+                    f"likely did not finish. Rebuild the master with "
+                    f"`cat {self.root}/pairs_*/*_pairs.txt > {pairs_file}` "
+                    f"(or re-run preprocessing, which skips existing outputs)."
+                )
             raise FileNotFoundError(
-                f"{pairs_file} not found. Root should point towards the preprocessed dsec directory containing master pairs.txt"
+                f"{pairs_file} not found. Root should point towards a preprocessed "
+                f"dataset directory containing master pairs.txt.{hint}"
                 )
         
         sequences = set(sequences) if sequences is not None else None
@@ -143,3 +159,38 @@ class E_LiteVPRDataset(Dataset):
         event_tensor = self._load_event(pair['event_path'])
         teacher_patches, teacher_attn = self._get_features(pair)
         return event_tensor, teacher_patches, teacher_attn, pair['timestamp_us']
+
+
+class ConcatE_LiteVPRDataset(ConcatDataset):
+    """Several E_LiteVPRDataset sources (e.g. DSEC + DDD20) as one dataset.
+
+    Each source keeps its own root and teacher-feature cache, so datasets
+    preprocessed separately can be trained on jointly without being merged on
+    disk. Re-exposes `pairs` and `sequence_names()` so anything written
+    against a single E_LiteVPRDataset -- notably train.py's day/night
+    sampler, which maps a sample index to its sequence name -- works
+    unchanged. ConcatDataset indexes its parts in order, so the concatenated
+    `pairs` list stays aligned with dataset indices.
+    """
+
+    def __init__(self, datasets: Iterable[E_LiteVPRDataset]):
+        datasets = list(datasets)
+        if not datasets:
+            raise ValueError("ConcatE_LiteVPRDataset requires at least one source dataset.")
+        super().__init__(datasets)
+
+        self.pairs = [pair for ds in datasets for pair in ds.pairs]
+
+        # Sequence names are the join key for night_sequences and for the
+        # per-sequence feature cache, so a name in two sources is ambiguous.
+        counts = Counter(name for ds in datasets for name in ds.sequence_names())
+        duplicates = sorted(name for name, c in counts.items() if c > 1)
+        if duplicates:
+            raise ValueError(
+                f"Sequence names present in more than one dataset source: {duplicates}. "
+                "Sequence names must be unique across sources."
+            )
+
+    def sequence_names(self):
+        """Sorted sequence names across all sources."""
+        return sorted({pair['sequence'] for pair in self.pairs})
