@@ -1,5 +1,9 @@
 defaults:
   - datasets: dsec
+  # Optional SECOND training source, absent unless asked for. Joint phase-1
+  # DSEC+DDD20 is `datasets@datasets_extra=ddd20`; without it every run
+  # behaves exactly as before. train.py appends it to the train split only.
+  - datasets@datasets_extra: null
   - model: student_model    # extraction script: run with `model=teacher_model`
   - training: phase1
   - _self_
