@@ -2,9 +2,8 @@
 DSEC Preprocessor script for E-LiteVPR.
 Does the following:
 1. Maps the DSEC dataset to have pairs of RGB and Events based on timestamps.
-2. Saves the chunked events as .npy files for faster loading for
-   a) event histograms, b) N-bin voxel grids, c) polarity time surfaces
-   (net third channel), d) polarity time surfaces (zeroed third channel).
+2. Saves the chunked events as .npy files for faster loading as event
+   histograms.
 """
 
 import os
@@ -178,93 +177,8 @@ def process_event_histogram(x_r, y_r, p, hot_mask, out_size, sensor_hw=(480, 640
 
     return np.stack([pos_hist, neg_hist, net_hist], axis=0)  # shape: (3, H_out, W_out)
 
-def process_event_time_surface(x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size,
-                               decay_frac=1.0, sensor_hw=(480, 640)):
-    """
-    Per-polarity exponential-decay time surface, evaluated at the window end
-    t_end_us (not the last event time -- keeps the reference consistent with
-    the histogram/voxel windowing).
-
-    decay_us = decay_frac * (t_end_us - t_start_us): tying the decay constant
-    to the TRUE window span (same span histogram/voxel already integrate over)
-    means the earliest event in the window always keeps a visible weight
-    (exp(-1/decay_frac)), instead of a fixed microsecond constant that would
-    silently discard most of the window if the window is longer than it, or
-    degenerate into a near-binary presence mask if much shorter. decay_frac=1.0
-    -> earliest event weight ~= 0.37, latest ~= 1.0.
-
-    Returns (on_surface, off_surface): each (H_out, W_out) float32 in [0, 1],
-    1.0 = an event of that polarity fired exactly at t_end_us, decaying
-    towards 0 the longer ago the pixel's last event of that polarity was.
-    Pixels with no event of a given polarity are exactly 0.
-    Events must be time-sorted ascending (true for DSEC/Brisbane loaders):
-    fancy-index assignment keeps the LAST (most recent) timestamp per pixel.
-    """
-    h, w = sensor_hw
-    span_us = float(t_end_us - t_start_us)
-    decay_us = decay_frac * span_us
-
-    memory = np.full((2, h, w), -np.inf, dtype=np.float64)  # [OFF, ON]
-    memory[p, y_r, x_r] = t.astype(np.float64)
-
-    surface = np.exp((memory - t_end_us) / decay_us)  # -inf -> 0, no clipping needed
-    off_surface, on_surface = surface[0], surface[1]
-
-    on_surface[hot_mask] = 0
-    off_surface[hot_mask] = 0
-
-    on_surface = _resize_to(on_surface.astype(np.float32), out_size)
-    off_surface = _resize_to(off_surface.astype(np.float32), out_size)
-
-    return on_surface, off_surface
-
-def process_event_voxel_grid(x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size,
-                             num_bins=3, sensor_hw=(480, 640)):
-    """
-    Groups net-polarity events into a voxel grid with `num_bins` temporal bins.
-    Bins are equal subdivisions of the TRUE inter-frame window
-    [t_start_us, t_end_us] (from RGB timestamps), not of the event extent.
-    The event at exactly t_end_us falls in the last bin (no boundary drop).
-    Per bin: pos/neg normalised TOGETHER (shared max) to preserve relative
-    polarity magnitude, then combined as net. Matches the histogram's
-    3-channel count for a shared DINOv3-compatible input.
-    """
-    voxels = np.zeros((num_bins, out_size[1], out_size[0]), dtype=np.float32)  # (B, H, W)
-
-    span = float(t_end_us - t_start_us)
-    if span <= 0:
-        return voxels # EventSlicer already returns None for such degenerate cases, but just in case.
-    
-    # Assign each event to a bin; t == t_end maps exactly to num_bins, so
-    # clip into the last bin. Float math, no integer edge truncation.
-    bin_indices =  ((t - t_start_us).astype(np.float64) * num_bins / span).astype(np.int64)
-    bin_indices = np.clip(bin_indices, 0, num_bins - 1)
-
-    for b in range(num_bins):
-        bin_mask = bin_indices == b
-        pos_mask = bin_mask & (p == 1)
-        neg_mask = bin_mask & (p == 0)
-
-        pos_hist = _accumulate_events(x_r[pos_mask], y_r[pos_mask], sensor_hw)
-        neg_hist = _accumulate_events(x_r[neg_mask], y_r[neg_mask], sensor_hw)
-
-        pos_hist[hot_mask] = 0
-        neg_hist[hot_mask] = 0
-
-        m = max(pos_hist.max(), neg_hist.max())
-        if m > 0:
-            pos_hist /= m
-            neg_hist /= m
-
-        net_hist = pos_hist - neg_hist  # net polarity histogram after normalization to preserve relative magnitude
-
-        voxels[b] = _resize_to(net_hist, out_size)
-
-    return voxels  # shape: (num_bins, H_out, W_out)
-
 def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, preprocessed_rgb_dir,
-                     preprocessed_events_hist_dir, preprocessed_events_voxel_dir,
-                     preprocessed_events_ts_net_dir, preprocessed_events_ts_zero_dir,
+                     preprocessed_events_hist_dir,
                      out_root, cfg):
     # Process a single sequence: load calibration, rectify map, timestamps, and build pairs of RGB and Events. 
     # Returns (n_pairs, n_skipped)
@@ -307,25 +221,16 @@ def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, prep
 
             rgb_output_path = preprocessed_rgb_dir / f"{seq}_{i:06d}.npy"
             event_hist_output_path = preprocessed_events_hist_dir / f"{seq}_{i:06d}.npy"
-            event_voxel_output_path = preprocessed_events_voxel_dir / f"{seq}_{i:06d}.npy"
-            event_ts_net_output_path = preprocessed_events_ts_net_dir / f"{seq}_{i:06d}.npy"
-            event_ts_zero_output_path = preprocessed_events_ts_zero_dir / f"{seq}_{i:06d}.npy"
 
             # pairs.txt stores paths relative to the output root, not absolute paths
             # This is important for portability and consistency across different environments.
             pair_line = (f"{t_end_us},"
                          f"{rgb_output_path.relative_to(out_root)},"
-                         f"{event_hist_output_path.relative_to(out_root)},"
-                         f"{event_voxel_output_path.relative_to(out_root)},"
-                         f"{event_ts_net_output_path.relative_to(out_root)},"
-                         f"{event_ts_zero_output_path.relative_to(out_root)}")
+                         f"{event_hist_output_path.relative_to(out_root)}")
 
             # skip frames whose output exists (if resumed)
             if (rgb_output_path.exists() and
-                event_hist_output_path.exists() and
-                event_voxel_output_path.exists() and
-                event_ts_net_output_path.exists() and
-                event_ts_zero_output_path.exists()):
+                event_hist_output_path.exists()):
                 pairs_lines.append(pair_line)
                 continue
 
@@ -351,24 +256,10 @@ def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, prep
             
             rgb_processed = process_rgb_image(seq_rgb_images[i], K_rect_event, K_rect_rgb, image_size=cfg.model.img_hw)
             event_histogram_processed = process_event_histogram(x_r, y_r, p, hot_mask, out_size=out_size, sensor_hw=cfg.datasets.SENSOR_HW)
-            event_voxel_processed = process_event_voxel_grid(x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size=out_size,
-                                                                num_bins=cfg.datasets.event_voxel_bins,
-                                                                sensor_hw=cfg.datasets.SENSOR_HW)
-            on_surface, off_surface = process_event_time_surface(
-                x_r, y_r, p, t, t_start_us, t_end_us, hot_mask, out_size=out_size,
-                decay_frac=cfg.datasets.event_timesurface_decay_frac,
-                sensor_hw=cfg.datasets.SENSOR_HW)
-            net_surface = on_surface - off_surface
-            zero_surface = np.zeros_like(on_surface)
-            event_ts_net_processed = np.stack([on_surface, off_surface, net_surface], axis=0)
-            event_ts_zero_processed = np.stack([on_surface, off_surface, zero_surface], axis=0)
 
             # uint8 RGB, fp16 events: ~2.2MB/frame vs ~5.3MB at full float32.
             np.save(rgb_output_path, rgb_processed)
             np.save(event_hist_output_path, event_histogram_processed.astype(np.float16))
-            np.save(event_voxel_output_path, event_voxel_processed.astype(np.float16))
-            np.save(event_ts_net_output_path, event_ts_net_processed.astype(np.float16))
-            np.save(event_ts_zero_output_path, event_ts_zero_processed.astype(np.float16))
 
             pairs_lines.append(pair_line)
 
@@ -386,16 +277,10 @@ def build_pairs(cfg: DictConfig):
     out_root = Path(cfg.output_dir) / "preprocessed_dsec"
     preprocessed_rgb_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "rgb"
     preprocessed_events_hist_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "events" / "histogram"
-    preprocessed_events_voxel_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "events" / "voxel"
-    preprocessed_events_ts_net_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "events" / "timesurface_net"
-    preprocessed_events_ts_zero_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "events" / "timesurface_zero"
     pairs_dir = out_root / "pairs_dsec"
 
     preprocessed_rgb_dir.mkdir(parents=True, exist_ok=True)
     preprocessed_events_hist_dir.mkdir(parents=True, exist_ok=True)
-    preprocessed_events_voxel_dir.mkdir(parents=True, exist_ok=True)
-    preprocessed_events_ts_net_dir.mkdir(parents=True, exist_ok=True)
-    preprocessed_events_ts_zero_dir.mkdir(parents=True, exist_ok=True)
     pairs_dir.mkdir(parents=True, exist_ok=True)
 
     rgb_dir = dataset_path / "RGB"
@@ -410,8 +295,6 @@ def build_pairs(cfg: DictConfig):
         try:
             n_pairs, n_skipped = process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir,
                                                   preprocessed_rgb_dir, preprocessed_events_hist_dir,
-                                                  preprocessed_events_voxel_dir,
-                                                  preprocessed_events_ts_net_dir, preprocessed_events_ts_zero_dir,
                                                   out_root, cfg)
             print(f"Sequence {seq}: Processed {n_pairs} pairs" + (f", skipped {n_skipped} pairs" if n_skipped > 0 else ""))
         except Exception as e:
