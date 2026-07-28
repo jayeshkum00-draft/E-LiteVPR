@@ -161,6 +161,34 @@ def patch(mode, q=DEFAULT_PERCENTILE):
     return fn
 
 
+def patch_eval(mode, q=DEFAULT_PERCENTILE):
+    """
+    Patch the EVAL-side representation (scripts/brisbane_representation.py).
+
+    That module carries its OWN private copy of `_norm_unit_max` and
+    `process_event_histogram` -- it does not import them from preprocess_dsec.
+    Brisbane and NSAVP descriptors are therefore built independently of the
+    training corpus, and `patch()` above has no effect on them.
+
+    This matters more than it looks: a student trained on p99 frames and
+    evaluated on unit-max frames sees a shifted input distribution at test
+    time, and would score badly for reasons that have nothing to do with the
+    hypothesis. The training corpus and the eval representation MUST use the
+    same mode. Call this from the eval script before any descriptor is built,
+    and delete cached descriptors from the unit-max run first.
+
+    brisbane_representation.build_representation resolves the name from its
+    module globals at call time, so rebinding takes effect. Its histogram is
+    semantically identical to the preprocessor's, so the same replacement is
+    a drop-in.
+    """
+    import brisbane_representation
+
+    fn = make_histogram_fn(mode, q)
+    brisbane_representation.process_event_histogram = fn
+    return fn
+
+
 # --- guards ------------------------------------------------------------------
 
 def self_test():
