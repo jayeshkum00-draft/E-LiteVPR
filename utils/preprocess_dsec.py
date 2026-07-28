@@ -1,3 +1,4 @@
+
 """
 DSEC Preprocessor script for E-LiteVPR.
 Does the following:
@@ -49,14 +50,35 @@ def rectify_event_coords(events, rectify_map, sensor_hw=(480, 640)):
     """
     Look up rectified coordinates for each event and drop events that land
     outside the sensor frame.
- 
+
     Returns (x_r, y_r, p, t) as aligned arrays with out-of-frame events removed.
-    x_r/y_r are int64 pixel indices (nearest-neighbour rounding).
+    x_r/y_r are FRACTIONAL (float64) rectified coordinates -- see below.
+
+    Why not nearest-neighbour rounding
+    ----------------------------------
+    rectify_map is a FORWARD map (raw pixel -> rectified pixel), so this is a
+    scatter. Rounding each destination with np.rint means that wherever the
+    undistortion locally stretches, the gap between two consecutive raw pixels
+    rounds to no pixel at all. Measured on interlaken_00_b's real map, that
+    left 6.36% of rectified pixels structurally unreachable, arranged in a
+    curved lattice following the radial distortion field. After the INTER_AREA
+    resize to 384 those pixels are not empty but attenuated to ~37% of their
+    neighbours -- a visible grid, ~25% high-frequency modulation, baked into
+    every DSEC frame.
+
+    It mattered because DSEC is the only source that rectifies (DDD20 and
+    Brisbane are single-chip DAVIS, nothing to correct), so the lattice was a
+    training-set-only texture absent from every evaluation frame.
+
+    Fractional coordinates + bilinear splatting in _accumulate_events drop the
+    modulation from 0.170 to 0.028 end-to-end on real night data, and raise
+    mean event level ~25% because mass stops being scattered into starved
+    pixels.
     """
     h, w = sensor_hw
     xy_rect = rectify_map[events['y'], events['x']]  # (N, 2) float
-    x_r = np.rint(xy_rect[:, 0]).astype(np.int64)
-    y_r = np.rint(xy_rect[:, 1]).astype(np.int64)
+    x_r = xy_rect[:, 0].astype(np.float64)
+    y_r = xy_rect[:, 1].astype(np.float64)
 
     # Drop events that land outside the sensor frame
     valid_mask = (x_r >= 0) & (x_r < w) & (y_r >= 0) & (y_r < h)
@@ -68,11 +90,39 @@ def rectify_event_coords(events, rectify_map, sensor_hw=(480, 640)):
     return x_r, y_r, p, t
 
 def _accumulate_events(x, y, sensor_hw=(480, 640)):
-    # Accumulate events into a histogram based on their x and y coordinates.
+    """
+    Accumulate events into a histogram, splitting each event across its four
+    neighbouring pixels by bilinear weight.
+
+    On INTEGER coordinates fx = fy = 0, so all weight lands on (x, y) and this
+    is bit-identical to the plain `np.add.at(hist, (y, x), 1)` it replaces.
+    DDD20 and Brisbane pass raw integer sensor coordinates and are therefore
+    unaffected; only DSEC, whose coordinates are fractional after
+    rectify_event_coords, changes.
+
+    Events in the outermost pixel row/column deposit slightly less than unit
+    mass, because their +1 neighbour falls outside the frame and is dropped.
+    That is a 1-px border effect; the interior conserves mass exactly.
+    """
     h, w = sensor_hw
-    hist = np.zeros((h, w), dtype=np.float32)
-    np.add.at(hist, (y, x), 1)
-    return hist
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    fx = x - x0
+    fy = y - y0
+
+    # Four corners gathered into one bincount rather than four np.add.at
+    # calls: np.add.at is an unbuffered ufunc and is ~10x slower, which is
+    # material over a whole-corpus preprocessing pass.
+    xs = np.concatenate([x0, x0 + 1, x0, x0 + 1])
+    ys = np.concatenate([y0, y0, y0 + 1, y0 + 1])
+    wt = np.concatenate([(1 - fx) * (1 - fy), fx * (1 - fy),
+                         (1 - fx) * fy, fx * fy])
+
+    m = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h) & (wt > 0)
+    hist = np.bincount(ys[m] * w + xs[m], weights=wt[m], minlength=h * w)
+    return hist.reshape(h, w).astype(np.float32)
 
 def compute_hot_pixel_mask(x_r, y_r, sensor_hw=(480, 640), threshold=99.5):
     """
