@@ -70,6 +70,7 @@ import numpy as np
 from omegaconf import DictConfig
 
 from preprocess_dsec import (
+    _accumulate_events,
     compute_hot_pixel_mask,
     process_event_histogram,
 )
@@ -242,6 +243,107 @@ def select_frames(frames, cfg):
     return kept
 
 
+def compute_persistent_hot_mask(events, kept, cfg, sensor_hw, window_us):
+    """
+    Per-RECORDING hot-pixel mask: persistence + polarity lock.
+
+    Why the per-window mask is not enough here
+    ------------------------------------------
+    compute_hot_pixel_mask takes the 99.5th percentile of nonzero counts inside
+    ONE window. On DSEC that works: ~230k active pixels with counts spanning
+    1-143, so the percentile sits well above the bulk. On DDD20 a 50 ms window
+    has ~3000 active pixels, max count ~9, and 71% of them hold exactly one
+    event -- the percentile lands near the top of a very short distribution and
+    the mask removes ~0.28% of active pixels. It is effectively inert.
+
+    A pixel emitting 1-2 events per window looks identical to signal inside any
+    single window. It is only exposed by looking ACROSS windows: measured on
+    rec1500329649, 3.66% of the sensor fired in >=20% of windows sampled 1 s
+    apart on a highway, and those pixels carried 44.7% of all events. Scene
+    content cannot do that.
+
+    Two criteria, both required
+    ---------------------------
+    fire_rate : fraction of windows in which the pixel emitted anything.
+    skew      : max(pos, neg) / (pos + neg) over the whole recording.
+
+    Persistence alone is unsafe -- on a highway the horizon and the car hood
+    sit at fixed image positions, so genuine structure also scores high. The
+    polarity lock separates them: a real edge fires ON as a surface brightens
+    and OFF as it darkens, so it stays near 0.5, while a stuck pixel emits one
+    polarity forever. Measured: masking at skew>=0.70 makes agreement with APS
+    gradients WORSE (it deletes real edges), while skew>=0.90 improves it.
+
+    Defaults (fire_rate>=0.02, skew>=0.95) were swept against the correlation
+    between the event image and the APS gradient magnitude -- an independent
+    witness, since a hot pixel has no reason to sit on a brightness edge. They
+    removed 7.85% of the sensor / 7.28% of events and improved that agreement
+    by 2.6% on rec1500329649. The optimum is a broad plateau over
+    fire_rate 0.02-0.10 at skew>=0.90; polarity lock is the discriminator that
+    matters, persistence is secondary.
+    """
+    min_rate = float(cfg.get('hot_persistence_min_rate', 0.02))
+    min_skew = float(cfg.get('hot_persistence_min_skew', 0.95))
+    if min_rate <= 0 or min_skew <= 0:
+        return np.zeros(sensor_hw, dtype=bool)
+
+    fire = np.zeros(sensor_hw, dtype=np.int32)
+    pos_total = np.zeros(sensor_hw, dtype=np.int64)
+    neg_total = np.zeros(sensor_hw, dtype=np.int64)
+    n_windows = 0
+    for t_end_us, _ in kept:
+        w = get_event_window(events, t_end_us, window_us)
+        if w['t'].size == 0:
+            continue
+        is_pos = w['p'] == 1
+        ph = _accumulate_events(w['x'][is_pos], w['y'][is_pos], sensor_hw)
+        nh = _accumulate_events(w['x'][~is_pos], w['y'][~is_pos], sensor_hw)
+        pos_total += ph.astype(np.int64)
+        neg_total += nh.astype(np.int64)
+        fire += ((ph + nh) > 0).astype(np.int32)
+        n_windows += 1
+
+    if n_windows == 0:
+        return np.zeros(sensor_hw, dtype=bool)
+
+    total = pos_total + neg_total
+    rate = fire / n_windows
+    skew = np.where(total > 0,
+                    np.maximum(pos_total, neg_total) / np.maximum(total, 1), 0.0)
+    return (rate >= min_rate) & (skew >= min_skew)
+
+
+def isolated_event_mask(x, y, sensor_hw, cfg):
+    """
+    Per-window background-activity filter: drop active pixels with no active
+    8-neighbour in the same window.
+
+    This catches what compute_persistent_hot_mask structurally cannot. Measured
+    on rec1500329649 AFTER the persistence mask, the sky still had 215 active
+    px/frame, but their median firing rate was 0.006 -- a typical one fires in
+    2 of 336 windows, and only 5 sky pixels exceed 20%. There is no persistence
+    to detect: it is a different pixel every frame, i.e. thermal/junction
+    leakage firing arbitrary sites (DVS "background activity").
+
+    What DOES separate it from signal is spatial support. A real brightness
+    edge spans many adjacent pixels, so its events have neighbours; an
+    independent leakage event almost never does. 66.4% of those residual sky
+    pixels had no active neighbour at all.
+
+    Only sensible on a sparse sensor. DSEC runs ~76% pixel fill, where almost
+    nothing is isolated and this would be a costly no-op -- hence DDD20-only.
+    """
+    min_neighbours = int(cfg.get('ba_min_neighbours', 1))
+    if min_neighbours <= 0:
+        return np.zeros(sensor_hw, dtype=bool)
+
+    active = _accumulate_events(x, y, sensor_hw) > 0
+    kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    n_neigh = cv2.filter2D(active.astype(np.uint8), -1, kernel,
+                           borderType=cv2.BORDER_CONSTANT)
+    return active & (n_neigh < min_neighbours)
+
+
 def get_event_window(events, t_end_us, window_us):
     """Events in (t_end_us - window_us, t_end_us], via searchsorted on the
     globally time-sorted event arrays."""
@@ -281,6 +383,15 @@ def process_recording(seq, h5_path, pairs_dir, out_root, cfg):
     print(f"Recording {seq}: kept {len(kept_frames)} frames after "
           f"{cfg.datasets.target_hz} Hz + exposure filtering.")
 
+    # Recording-level hot pixels. Computed once over every kept window, then
+    # unioned with the per-window mask below: the per-window percentile catches
+    # pixels that are hot right now, this catches pixels that are quietly hot
+    # always, which on this sparse sensor is the dominant failure mode.
+    persistent_hot = compute_persistent_hot_mask(
+        events, kept_frames, cfg.datasets, sensor_hw, window_us)
+    print(f"Recording {seq}: persistent hot mask {persistent_hot.sum()} px "
+          f"({100 * persistent_hot.mean():.2f}% of sensor)")
+
     pairs_lines = []
     n_skipped = 0
     for i, (t_end_us, frame8) in enumerate(kept_frames):
@@ -312,6 +423,8 @@ def process_recording(seq, h5_path, pairs_dir, out_root, cfg):
         x_r, y_r, p = window['x'], window['y'], window['p']
         hot_mask = compute_hot_pixel_mask(x_r, y_r, sensor_hw=sensor_hw,
                                            threshold=cfg.datasets.event_hot_pixels_threshold)
+        hot_mask |= persistent_hot
+        hot_mask |= isolated_event_mask(x_r, y_r, sensor_hw, cfg.datasets)
 
         rgb_processed = process_aps_frame(frame8, out_size)
         event_histogram_processed = process_event_histogram(
