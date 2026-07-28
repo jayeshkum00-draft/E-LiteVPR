@@ -13,6 +13,8 @@ Run:
         phase1_weights=/kaggle/working/checkpoints/best_phase1_salad_histogram.pth
 """
 
+import hydra
+from omegaconf import DictConfig
 import torch
 
 import evaluate_brisbane
@@ -42,10 +44,24 @@ def build_model_salad(cfg, device):
     return model.to(device), "salad"
 
 
-# evaluate_brisbane.main() calls build_model() from its own module namespace,
-# so rebinding the name here is enough to redirect it.
+# evaluate_brisbane.main() calls build_model() from its own module namespace
+# (line 319), so rebinding the name here is enough to redirect it.
 evaluate_brisbane.build_model = build_model_salad
 
 
+# The @hydra.main entry point MUST be declared here, not reused from
+# evaluate_brisbane. Hydra resolves config_path from the task function's
+# __module__ (hydra/_internal/utils.py:detect_calling_file_or_module_from_task_
+# function): anything other than "__main__" is treated as a PACKAGE and
+# ../configs is looked up as an importable module, which fails with
+# "Primary config module 'configs' not found". Declaring it in this file makes
+# __module__ == "__main__", so Hydra uses the file path instead.
+# .__wrapped__ is the undecorated body -- functools.wraps sets it, and Hydra's
+# own unwrap loop above depends on it, so it is safe to rely on.
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig):
+    evaluate_brisbane.main.__wrapped__(cfg)
+
+
 if __name__ == "__main__":
-    evaluate_brisbane.main()
+    main()
