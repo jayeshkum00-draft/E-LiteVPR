@@ -38,8 +38,6 @@ from omegaconf import DictConfig
 from preprocess_dsec import (
     process_sequence,
     process_event_histogram,
-    process_event_voxel_grid,
-    process_event_time_surface,
     rectify_event_coords,
     compute_hot_pixel_mask,
 )
@@ -58,7 +56,6 @@ def self_test():
     """
     sensor_hw = (480, 640)
     h, w = sensor_hw
-    out_size = (64, 64)
     rng = np.random.default_rng(0)
 
     # Identity rectify map + one known-shift map
@@ -109,46 +106,13 @@ def self_test():
     assert abs(hist[2].max() - 1.0) < 1e-6 or abs(hist[2].min() + 1.0) < 1e-6, \
         "SELF-TEST FAIL: net channel not normalized to unit max-abs"
 
-    # -- voxel: window-boundary bins, event conservation incl. t == t_end --
-    vox = process_event_voxel_grid(x_r, y_r, p_r, t_r, 0, 50000, hot,
-                                   out_size=out_size, num_bins=3, sensor_hw=sensor_hw)
-    assert vox.shape == (3, out_size[1], out_size[0]), \
-        f"SELF-TEST FAIL: voxel shape {vox.shape}"
-    span = 50000.0
-    bin_idx = np.clip((t_r.astype(np.float64) * 3 / span).astype(np.int64), 0, 2)
-    assert bin_idx.size == t_r.size and bin_idx[t_r == 50000].min() == 2, \
-        "SELF-TEST FAIL: event at t_end not assigned to last bin"
-
     # -- hot pixel mask detects an injected hot pixel --
     xh = np.concatenate([x_r, np.full(5000, 100)])
     yh = np.concatenate([y_r, np.full(5000, 200)])
     mask = compute_hot_pixel_mask(xh, yh, sensor_hw=sensor_hw, threshold=99.5)
     assert mask[200, 100], "SELF-TEST FAIL: injected hot pixel not detected"
 
-    # -- time surface: polarity separation, bounded [0,1] -- at full sensor
-    # res (out_size=(w,h)) so pixel indices are exact, same as the histogram
-    # check above.
-    on_full, off_full = process_event_time_surface(
-        x_r, y_r, p_r, t_r, t_start_us=0, t_end_us=50000, hot_mask=hot, out_size=(w, h),
-        decay_frac=1.0, sensor_hw=sensor_hw)
-    assert on_full.shape == (h, w) == off_full.shape, \
-        f"SELF-TEST FAIL: time surface shape {on_full.shape}"
-    assert on_full.min() >= 0.0 and on_full.max() <= 1.0 + 1e-6, \
-        "SELF-TEST FAIL: ON time surface not bounded in [0, 1]"
-    assert off_full.min() >= 0.0 and off_full.max() <= 1.0 + 1e-6, \
-        "SELF-TEST FAIL: OFF time surface not bounded in [0, 1]"
-    # pos-heavy pixel (x=51, y=61): only ON events -> OFF must be exactly 0,
-    # ON must be > 0 (last event at t=50000 -> decay factor exactly 1.0)
-    assert off_full[61, 51] == 0.0, \
-        "SELF-TEST FAIL: OFF channel nonzero at a pixel with no OFF events"
-    assert abs(on_full[61, 51] - 1.0) < 1e-6, \
-        "SELF-TEST FAIL: ON surface at the most recent event's pixel should be 1.0"
-    # balanced pixel (x=50, y=60): both polarities present -> both nonzero
-    assert on_full[60, 50] > 0.0 and off_full[60, 50] > 0.0, \
-        "SELF-TEST FAIL: balanced pixel missing a polarity channel"
-
-    print("SELF-TEST PASS: rectification, histogram channels, voxel bins, "
-          "hot-pixel mask, time surface")
+    print("SELF-TEST PASS: rectification, histogram channels, hot-pixel mask")
 
 
 def zip_sequence_outputs(seq, out_root, pairs_dir, output_dirs, zip_dest):
@@ -195,11 +159,8 @@ def main(cfg: DictConfig):
     out_root = Path(cfg.output_dir) / "preprocessed_dsec"
     rgb_out = out_root / "rgb"
     hist_out = out_root / "events" / "histogram"
-    voxel_out = out_root / "events" / "voxel"
-    ts_net_out = out_root / "events" / "timesurface_net"
-    ts_zero_out = out_root / "events" / "timesurface_zero"
     pairs_dir = out_root / "pairs_dsec"
-    for d in (rgb_out, hist_out, voxel_out, ts_net_out, ts_zero_out, pairs_dir):
+    for d in (rgb_out, hist_out, pairs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     rgb_dir = dataset_path / "RGB"
@@ -229,17 +190,17 @@ def main(cfg: DictConfig):
             n_pairs, n_skipped = process_sequence(
                 seq, STAGING_DIR / "RGB", STAGING_DIR / "Events",
                 STAGING_DIR / "Calibrations", pairs_dir,
-                rgb_out, hist_out, voxel_out, ts_net_out, ts_zero_out, out_root, cfg)
+                rgb_out, hist_out, out_root, cfg)
             print(f"{seq}: {n_pairs} pairs"
                   + (f", {n_skipped} skipped" if n_skipped else ""))
 
             # 3) zip -> Drive: sequence durably done
             zip_sequence_outputs(seq, out_root, pairs_dir,
-                                 (rgb_out, hist_out, voxel_out, ts_net_out, ts_zero_out), zip_dest)
+                                 (rgb_out, hist_out), zip_dest)
 
             # 4) free local disk
             shutil.rmtree(STAGING_DIR, ignore_errors=True)
-            for d in (rgb_out, hist_out, voxel_out, ts_net_out, ts_zero_out):
+            for d in (rgb_out, hist_out):
                 for f in d.glob(f"{seq}_*.npy"):
                     f.unlink()
         except Exception as e:
