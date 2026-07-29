@@ -49,6 +49,17 @@ train_seq_list:
   - 'zurich_city_10_b'
   - 'zurich_city_11_a'
   - 'zurich_city_11_b'
+  - 'interlaken_00_a'
+  - 'interlaken_00_b'
+  - 'interlaken_01_a'
+  - 'thun_01_a'
+  - 'thun_01_b'
+  - 'zurich_city_13_a'
+  - 'zurich_city_13_b'
+  - 'zurich_city_14_a'
+  - 'zurich_city_14_b'
+  - 'zurich_city_14_c'
+  - 'zurich_city_15_a'
 
 val_seq_list:
   - 'interlaken_00_d'
@@ -68,3 +79,4 @@ night_sequences:
   - 'zurich_city_09_e'
   - 'zurich_city_10_a'
   - 'zurich_city_10_b'
+  - 'zurich_city_12_a'
