@@ -67,7 +67,7 @@ class E_LiteVPRDataset(Dataset):
                 if not line:
                     continue
                 entries = line.split(',') # comma-separated
-                assert len(entries) == 6, f"Expected 6 entries, got {len(entries)}"
+                assert len(entries) == 6 or len(entries) == 3, f"Expected 6 or 3 entries, got {len(entries)}"
 
                 seq_name = sequence_name_from_rel_path(entries[1])
                 seen_sequences.add(seq_name)
