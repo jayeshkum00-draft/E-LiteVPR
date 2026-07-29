@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Optional
 
 import hydra
 import numpy as np
@@ -28,7 +29,7 @@ def read_pairs(root_dir: str, pairs_name: str = 'pairs.txt'):
             if not line or line.startswith('#'):
                 continue # skip empty lines and comments
             entries = [e.strip() for e in line.split(',')]
-            if len(entries) < 4:
+            if len(entries) < 3:
                 raise ValueError(f"Invalid line in pairs.txt at line {ln + 1}: {line}")
             rgb_path = entries[1]
             seq_name = rgb_path.split('/')[1].rsplit('_', 1)[0] # Extract sequence name from the path
@@ -72,7 +73,8 @@ def load_rgb_batch(root_dir: str, rel_paths: list[str], cfg: DictConfig) -> torc
     return torch.from_numpy(np.stack(arrs)) # (B,3,H,W) uint8
 
 @torch.inference_mode()
-def extract_batch(model, n_prefix: int, rgb_uint8: torch.Tensor, device, use_amp: bool, cfg):
+def extract_batch(model, n_prefix: int, rgb_uint8: torch.Tensor, device, use_amp: bool, cfg,
+                  rel_paths: Optional[list[str]] = None):
     rgb = rgb_uint8.to(device, non_blocking=True).float().div_(255.0) 
     mean = torch.tensor(list(cfg.model.imagenet_mean), device=device).view(1, 3, 1, 1)
     std = torch.tensor(list(cfg.model.imagenet_std), device=device).view(1, 3, 1, 1)
@@ -95,9 +97,22 @@ def extract_batch(model, n_prefix: int, rgb_uint8: torch.Tensor, device, use_amp
     # fail fast — a NaN here poisons every epoch downstream
     for name, t in (("patches", patches), ("cls", cls_token), ("attn", attn)):
         if not torch.isfinite(t).all():
+            # Name the offending frames: a non-finite teacher output is either
+            # fp16 overflow (fixed by the override) or one bad input frame, and
+            # you cannot tell which without knowing where it came from.
+            bad = "unknown (no paths passed)"
+            if rel_paths is not None:
+                per_sample = ~torch.isfinite(t.flatten(1)).all(dim=1)
+                bad_idx = per_sample.nonzero().flatten().tolist()
+                bad = ", ".join(rel_paths[i] for i in bad_idx[:5])
+                if len(bad_idx) > 5:
+                    bad += f", ... ({len(bad_idx)} of {len(rel_paths)} in batch)"
             raise FloatingPointError(
-                f"non-finite values in teacher {name}; "
-                f"re-run with 'cfg.model.enable_amp=False' to rule out fp16 overflow"
+                f"non-finite values in teacher {name} for: {bad}. "
+                f"If AMP is on, re-run with the override 'model.enable_amp=False' "
+                f"(note: NOT 'cfg.model.enable_amp=False' -- that silently creates a "
+                f"new unused key and leaves AMP enabled) to rule out fp16 overflow. "
+                f"If it persists in fp32, inspect those .npy frames instead."
             )
 
     return (cls_token.half().cpu().numpy(),
@@ -134,7 +149,8 @@ def process_sequence(model, n_prefix, root, seq, frames, out_dir, batch_size, de
     for start in tqdm(range(0, n, batch_size), desc=seq, leave=False):
         chunk = frames[start:start + batch_size]
         x = load_rgb_batch(root, chunk, cfg)
-        cls_np, patch_np, attn_np = extract_batch(model, n_prefix, x, device, use_amp, cfg)
+        cls_np, patch_np, attn_np = extract_batch(model, n_prefix, x, device, use_amp, cfg,
+                                                  rel_paths=chunk)
         end = start + len(chunk)
         cls_all[start:end] = cls_np
         patches_all[start:end] = patch_np
@@ -175,9 +191,11 @@ def main(cfg: DictConfig):
 
     # sanity check before starting the extraction
     first_seq = next(iter(seq_to_frames))
-    _ = extract_batch(model, n_prefix, 
-                      load_rgb_batch(cfg.datasets.root_dir, seq_to_frames[first_seq][:1], cfg),
-                      device, cfg.model.enable_amp, cfg)
+    probe = seq_to_frames[first_seq][:1]
+    print(f"AMP: {'fp16 autocast' if cfg.model.enable_amp else 'disabled (fp32)'}")
+    _ = extract_batch(model, n_prefix,
+                      load_rgb_batch(cfg.datasets.root_dir, probe, cfg),
+                      device, cfg.model.enable_amp, cfg, rel_paths=probe)
     print("startup self-test passed (1 frame end-to-end)")
 
     for seq, frames in seq_to_frames.items():
