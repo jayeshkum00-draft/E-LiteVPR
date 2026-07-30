@@ -75,6 +75,32 @@ def build_input_norm(kind, in_channels):
     raise ValueError(f"unknown input norm {kind!r}; use instance|layer|none")
 
 
+class _PerSampleNorm(nn.Module):
+    """Per-sample normaliser that still looks like a BatchNorm to callers.
+
+    train.py:393 logs `model.input_norm.running_mean.mean().item()` every
+    epoch. InstanceNorm2d(track_running_stats=False) has running_mean=None and
+    LayerNorm/Identity have no such attribute, so the job dies at the end of
+    epoch 1. An INERT buffer is registered here purely so that logging line
+    keeps working with the pipeline script unmodified.
+
+    The buffer is never read or written by forward -- it stays 0 for the whole
+    run, which is the honest value: a per-sample normaliser HAS no running
+    statistics. Do not be tempted to use InstanceNorm2d(track_running_stats=
+    True) to satisfy the logger; that reintroduces eval-time global statistics,
+    which is precisely the day/night condition shift this variant exists to
+    remove.
+    """
+
+    def __init__(self, kind, num_features):
+        super().__init__()
+        self.norm = build_input_norm(kind, num_features)
+        self.register_buffer("running_mean", torch.zeros(num_features))
+
+    def forward(self, x):
+        return self.norm(x)
+
+
 class EventViTStudentPerSampleNorm(EventViTStudent):
     """EventViTStudent with `input_norm` swapped for a per-sample normaliser.
 
@@ -86,7 +112,7 @@ class EventViTStudentPerSampleNorm(EventViTStudent):
         super().__init__(*args, **kwargs)
         kind = input_norm_kind or os.environ.get("INPUT_NORM", "instance")
         self.input_norm_kind = kind
-        self.input_norm = build_input_norm(kind, self.in_channels)
+        self.input_norm = _PerSampleNorm(kind, self.in_channels)
         print(f"input_norm: {kind} (replaces BatchNorm2d)")
 
 
