@@ -180,6 +180,16 @@ def main(cfg: DictConfig):
         seqs = sorted(p.parent.name for p in features_dir.glob("*/frames.txt"))
         if not seqs:
             raise SystemExit(f"No */frames.txt under {features_dir}")
+
+        # `to_exclude` is honoured here as well as in train_ext.py: if the
+        # DINOv3 pass was run over the unfiltered pairs.txt, the excluded
+        # sequence already has a frames.txt and would otherwise be cached.
+        excluded = set(OmegaConf.select(dcfg, "to_exclude") or [])
+        if excluded:
+            dropped = [s for s in seqs if s in excluded]
+            seqs = [s for s in seqs if s not in excluded]
+            print(f"  to_exclude: skipping {dropped or 'nothing'}")
+
         print(f"\n{features_dir}: {len(seqs)} sequences")
         for seq in seqs:
             n, how = process_sequence(seq, root, features_dir, out_dir,
