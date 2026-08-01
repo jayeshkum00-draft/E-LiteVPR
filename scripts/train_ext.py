@@ -27,6 +27,29 @@ by its override list and cells of an ablation table are directly comparable.
         objective in two epochs. batch_size must be a multiple of block_size;
         this is enforced, not assumed.
 
+    +training.struct_mask_diag=true    (default false)
+        Drop the self-similarity term from BOTH softmaxes (B x B -> B x (B-1)).
+        T[i,i] is 1.0 by construction, carries no information about how frames
+        relate to EACH OTHER, and is satisfied by any student. Measured at
+        tau=0.05 (probe_target_information.py) it is where the target's mass
+        went: MegaLoc put 0.9993 of it there, so 99.93% of that objective was a
+        term that teaches nothing. DINOv3 GeM put 0.0684 there.
+
+    +training.struct_standardize=true  (default false)
+        Z-score each similarity matrix over its off-diagonal before dividing by
+        tau, so tau is measured in units of WITHIN-BATCH sigma and stops
+        depending on the teacher's cosine scale.
+        Why: compute_structural_loss divides raw cosines by a single shared tau,
+        so what the softmax sees is (cosine spread)/tau. Measured spreads are
+        not comparable -- DINOv3 GeM off_cos 0.9606 (spread ~0.05, logit spread
+        ~1 at tau=0.05 -> near-uniform target, eff_nbrs 30.15 of 31) vs MegaLoc
+        off_cos 0.0548 (spread ~0.95, logit spread ~19 -> near-identity target).
+        One tau cannot serve both, and a STRONGER VPR teacher makes distinct
+        places more orthogonal, i.e. its fixed-tau target carries LESS
+        information. That is the mechanism by which better teachers scored
+        worse. After standardising, tau ~ 1.0 is the sensible setting for any
+        teacher; the run WARNS if tau is left at the raw-cosine default.
+
     +training.use_scheduler=true       (default false)
     +training.warmup_frac=0.03
     +training.min_lr_frac=0.05
@@ -71,6 +94,8 @@ _DEFAULTS = {
     "use_block_sampler": False,
     "block_size": 8,
     "night_frac": 0.5,
+    "struct_mask_diag": False,
+    "struct_standardize": False,
     "use_scheduler": False,
     "warmup_frac": 0.03,
     "min_lr_frac": 0.05,
@@ -82,6 +107,14 @@ _state = {"steps_per_epoch": None, "teacher_dir": None, "teacher_file": None}
 _CACHED_GLOBAL = {
     "megaloc": ("megaloc.npy", "cache_megaloc.py"),
     "dinov3_gem": ("gem.npy", "cache_teacher_gem.py"),
+    # cls.npy is already written by feature_extractor.py:161 alongside
+    # patches.npy -- no new caching pass. Use it to sidestep GeM entirely:
+    # GeM does clamp(min=1e-6).pow(3) on RAW SIGNED DINOv3 tokens
+    # (feature_extractor.py:88 saves hidden[:, n_prefix:, :] unrectified), so
+    # every negative coordinate collapses to a shared constant. Measured
+    # consequence: within-sequence mean cosine 0.96-0.99 on all 59 sequences
+    # regardless of scene, condition or dataset.
+    "dinov3_cls": ("cls.npy", "feature_extractor.py"),
 }
 
 
@@ -156,6 +189,49 @@ def compute_losses_global(model_out, teacher_desc, teacher_attn, teacher_gem,
     structural = train.compute_structural_loss(
         student_global, teacher_global, temperature)
     return structural_weight * structural, structural.new_zeros(()), structural
+
+
+# ----------------------------------------------------------- struct loss ---
+def _drop_diag(sim):
+    """(B, B) -> (B, B-1), removing T[i,i].
+
+    Selection rather than masked_fill(-inf): a masked logit gives target 0 at
+    that position and F.kl_div then evaluates 0 * (log 0 - (-inf)) = nan. Only
+    dropping the column avoids infinities entirely.
+    """
+    B = sim.shape[0]
+    off = ~torch.eye(B, dtype=torch.bool, device=sim.device)
+    return sim.masked_select(off).view(B, B - 1)
+
+
+def _standardize(sim):
+    """Z-score a similarity matrix so tau is in units of within-batch sigma."""
+    return (sim - sim.mean()) / sim.std().clamp(min=1e-6)
+
+
+def make_structural_loss(mask_diag, standardize):
+    """train.compute_structural_loss with the self-term and/or the teacher's
+    cosine scale removed. Identical to the original when both are False."""
+
+    def structural_loss(student_global, teacher_global, temperature=0.05):
+        # float32: std/softmax under autocast fp16 is where a near-degenerate
+        # similarity matrix turns into inf/nan.
+        s = torch.nn.functional.normalize(student_global.float(), p=2, dim=-1)
+        t = torch.nn.functional.normalize(teacher_global.float(), p=2, dim=-1)
+        s_sim, t_sim = s @ s.T, t @ t.T
+
+        if mask_diag:
+            s_sim, t_sim = _drop_diag(s_sim), _drop_diag(t_sim)
+        if standardize:
+            s_sim, t_sim = _standardize(s_sim), _standardize(t_sim)
+
+        s_sim, t_sim = s_sim / temperature, t_sim / temperature
+        return torch.nn.functional.kl_div(
+            torch.nn.functional.log_softmax(s_sim, dim=-1),
+            torch.nn.functional.softmax(t_sim, dim=-1),
+            reduction="batchmean")
+
+    return structural_loss
 
 
 # ------------------------------------------------------------- scheduler ---
@@ -236,6 +312,8 @@ def _install(cfg):
     teacher = str(_flag(cfg, "teacher")).lower()
     use_blocks = bool(_flag(cfg, "use_block_sampler"))
     use_sched = bool(_flag(cfg, "use_scheduler"))
+    mask_diag = bool(_flag(cfg, "struct_mask_diag"))
+    standardize = bool(_flag(cfg, "struct_standardize"))
 
     print("=" * 70)
     print(f"train_ext: teacher={teacher}  block_sampler={use_blocks}"
@@ -243,8 +321,24 @@ def _install(cfg):
              f"night_frac={float(_flag(cfg, 'night_frac'))})" if use_blocks else "")
           + f"  scheduler={use_sched}"
           + (f" (warmup_frac={float(_flag(cfg, 'warmup_frac'))}, "
-             f"min_lr_frac={float(_flag(cfg, 'min_lr_frac'))})" if use_sched else ""))
+             f"min_lr_frac={float(_flag(cfg, 'min_lr_frac'))})" if use_sched else "")
+          + f"  mask_diag={mask_diag}  standardize={standardize}")
     print("=" * 70)
+
+    if mask_diag or standardize:
+        tau = float(cfg.training.temperature)
+        train.compute_structural_loss = make_structural_loss(mask_diag, standardize)
+        print(f"  structural target: "
+              f"{'B x (B-1), self-term dropped' if mask_diag else 'B x B'}"
+              f"{', z-scored (tau in sigma units)' if standardize else ''}, "
+              f"tau={tau:g}")
+        if standardize and tau < 0.2:
+            print(f"  WARNING: struct_standardize=true rescales the similarity "
+                  f"matrix to unit variance, so tau is now in units of "
+                  f"within-batch sigma. tau={tau:g} is the RAW-COSINE default "
+                  f"and gives a logit spread of ~{1 / tau:.0f} sigma -- a "
+                  f"near-one-hot target. Pass training.temperature=1.0 unless "
+                  f"you are deliberately sweeping it.")
 
     if teacher in _CACHED_GLOBAL:
         fname, script = _CACHED_GLOBAL[teacher]
