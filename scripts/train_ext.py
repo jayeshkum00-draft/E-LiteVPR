@@ -15,6 +15,42 @@ by its override list and cells of an ablation table are directly comparable.
                   reduces both sides to a B x B matrix of pairwise cosines
                   before comparing, so the student stays 1024-d and unchanged.
 
+    +training.teacher_b=dinov3_gem     (default null = single teacher)
+    +training.teacher_b_dir=<dir written by cache_teacher_gem.py>
+    +training.teacher_mix=0.2
+    +training.teacher_b_mask_diag / _standardize / _temperature
+        SECOND structural target, summed as
+
+            mix * L(student, teacher_A) + (1 - mix) * L(student, teacher_B)
+
+        with per-teacher loss settings, because the two teachers do NOT want
+        the same objective. Measured (Brisbane [all], mean over L=10/20/30):
+        MegaLoc needs mask_diag+z-score (raw tau=0.05 gave grad norm 2.1e-09 --
+        no gradient at all), while the SAME fix HURT DINOv3 on every cell
+        (37.27 -> 31.27) because its near-uniform raw target acts as a
+        smoothing prior and smooth descriptors are what 30-frame sequence
+        matching integrates. Sharing one loss setting throws away one of the
+        two teachers. So teacher A uses training.temperature /
+        struct_mask_diag / struct_standardize, and teacher B has its own trio,
+        defaulting to the RAW loss (tau=0.05, no mask, no z-score) that
+        produced the 37.27 model.
+
+        Why this exists: descriptor-level fusion of those two checkpoints,
+        [sqrt(a)*d_A, sqrt(1-a)*d_B], beats BOTH endpoints on EVERY cell --
+        a=0.20 gives day-day 84.07 / day-night 51.92 vs 42.13 (A alone) and
+        37.27 (B alone). That proves the targets carry non-redundant
+        information, but it ships two backbones (~44M params, two forward
+        passes) and makes `a` a test-time knob read off the benchmark. Summing
+        the targets at train time gets one ~22M student and turns `a` into an
+        ordinary loss weight.
+
+        Both teachers must be cached-global (megaloc | dinov3_gem |
+        dinov3_cls); teacher=dinov3 computes GeM in-training from patches and
+        has no cache to pair. dinov3_gem IS that same GeM(p=3) over the same
+        patches, just precomputed, so it reproduces teacher=dinov3 exactly.
+        Widths need not match (8448 vs 1024): each loss reduces its side to a
+        B x B cosine matrix first.
+
     +training.use_block_sampler=true   (default false)
     +training.block_size=8
     +training.night_frac=0.5
@@ -91,6 +127,12 @@ _DEFAULTS = {
     "teacher": "dinov3",
     "teacher_dir": None,
     "megaloc_dir": None,          # back-compat alias for teacher_dir
+    "teacher_b": None,
+    "teacher_b_dir": None,
+    "teacher_mix": 0.5,           # weight on teacher A; 0.5 = untuned default
+    "teacher_b_mask_diag": False,  # defaults reproduce the RAW loss that
+    "teacher_b_standardize": False,  # produced the 37.27 DINOv3 model
+    "teacher_b_temperature": 0.05,
     "use_block_sampler": False,
     "block_size": 8,
     "night_frac": 0.5,
@@ -102,6 +144,13 @@ _DEFAULTS = {
 }
 
 _state = {"steps_per_epoch": None, "teacher_dir": None, "teacher_file": None}
+
+# two-teacher state. dim_a is resolved in the MAIN process at install time (see
+# _probe_width) -- a DataLoader worker cannot write it back, so it must never be
+# discovered lazily inside _get_features.
+_two = {"dir_a": None, "file_a": None, "dir_b": None, "file_b": None,
+        "dim_a": None, "loss_a": None, "loss_b": None,
+        "tau_a": None, "tau_b": None, "mix": None, "diag_done": False}
 
 # teacher -> filename written by the corresponding cache script
 _CACHED_GLOBAL = {
@@ -189,6 +238,129 @@ def compute_losses_global(model_out, teacher_desc, teacher_attn, teacher_gem,
     structural = train.compute_structural_loss(
         student_global, teacher_global, temperature)
     return structural_weight * structural, structural.new_zeros(()), structural
+
+
+# ---------------------------------------------------------- two teachers ---
+def _open_cache(root, fname, script, seq, features_dir):
+    """mmap <root>/<seq>/<fname>, asserting it is row-aligned with frames.txt.
+
+    Same contract as CachedGlobalDataset._get_features (left untouched so the
+    single-teacher path that produced every recorded result is unchanged): the
+    row index comes from frames.txt, so a cache with the wrong number of rows
+    would silently pair every frame with a different frame's descriptor.
+    """
+    path = Path(root) / seq / fname
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} not found -- run {script} for this corpus first. "
+            f"Sequence names must match the teacher cache.")
+    arr = np.load(path, mmap_mode="r")
+    n_rows = sum(1 for ln in
+                 (features_dir / seq / "frames.txt").read_text().splitlines()
+                 if ln.strip())
+    if arr.shape[0] != n_rows:
+        raise RuntimeError(
+            f"{path} has {arr.shape[0]} rows but {seq}/frames.txt has {n_rows}. "
+            f"The cache is misaligned with the row index and every target would "
+            f"be the wrong frame. Re-run {script} for {seq}.")
+    return arr
+
+
+def _probe_width(root, fname, script):
+    """Descriptor width from any one cached sequence, read in the main process.
+
+    Doubles as the fail-fast check that the cache exists at all -- otherwise a
+    missing teacher_b_dir would only surface inside a worker on the first batch.
+    """
+    hits = sorted(Path(root).glob(f"*/{fname}"))
+    if not hits:
+        raise SystemExit(
+            f"no */{fname} under {root} -- run {script} for this corpus first.")
+    return int(np.load(hits[0], mmap_mode="r").shape[1])
+
+
+class TwoTeacherDataset(E_LiteVPRDataset):
+    """Serves both teachers' descriptors concatenated into one (1, Da+Db) row.
+
+    Packing rather than returning a tuple keeps the collate, the (B, 1, D)
+    contract and __init__'s `patches.ndim == 2 and attn.ndim == 1` probe exactly
+    as they are; compute_losses_two splits at _two["dim_a"].
+    """
+
+    def _get_features(self, pair):
+        seq = pair["sequence"]
+        if seq not in self._mmaps:
+            self._mmaps[seq] = (
+                _open_cache(_two["dir_a"], *_two["file_a"], seq, self.features_dir),
+                _open_cache(_two["dir_b"], *_two["file_b"], seq, self.features_dir),
+            )
+        arr_a, arr_b = self._mmaps[seq]
+        row = self._row_index[pair["feature_key"]]
+        da = torch.from_numpy(np.ascontiguousarray(arr_a[row]).astype(np.float32))
+        db = torch.from_numpy(np.ascontiguousarray(arr_b[row]).astype(np.float32))
+        return torch.cat([da, db]).unsqueeze(0), torch.zeros(1)
+
+
+def compute_losses_two(model_out, teacher_desc, teacher_attn, teacher_gem,
+                       use_agfd, structural_weight, temperature,
+                       patch_weight=1.0):
+    """mix * L(student, A) + (1 - mix) * L(student, B), per-teacher settings.
+
+    `temperature` (cfg.training.temperature) is teacher A's; teacher B uses
+    training.teacher_b_temperature. Signature and 3-tuple return match
+    train.compute_losses so train_epoch/validate_epoch call it unchanged.
+    """
+    if patch_weight:
+        raise ValueError(
+            f"training.patch_loss_weight={patch_weight} but cached GLOBAL "
+            f"teacher descriptors have no patch target. Pass "
+            f"training.patch_loss_weight=0.")
+    _student_patches, student_global = model_out
+    packed = teacher_desc.squeeze(1)                      # (B, 1, Da+Db)
+    da = _two["dim_a"]
+    loss_a = _two["loss_a"](student_global, packed[:, :da], _two["tau_a"])
+    loss_b = _two["loss_b"](student_global, packed[:, da:], _two["tau_b"])
+    mix = _two["mix"]
+    if not _two["diag_done"]:
+        _report_mix(student_global, loss_a, loss_b, mix)
+    structural = mix * loss_a + (1.0 - mix) * loss_b
+    return structural_weight * structural, structural.new_zeros(()), structural
+
+
+def _report_mix(student_global, loss_a, loss_b, mix):
+    """One-time: what fraction of the gradient does `mix` actually give A?
+
+    teacher_mix is NOT scale-free, and the two scales disagree about which
+    teacher dominates. Synthetic descriptors matched to the measured geometries
+    (MegaLoc off_cos 0.055 / DINOv3 GeM 0.961) give L_b = 16x L_a but
+    |g_a| = 2.3x |g_b| -- so at mix=0.2 teacher A is 1.5% of the loss VALUE and
+    37% of the GRADIENT. The gradient is what trains the student, so that is
+    the number to set `mix` by, and it must be read off the real caches rather
+    than assumed. Same failure class as one shared tau across two teachers.
+
+    Costs two extra backward passes through the head, once per run.
+    """
+    _two["diag_done"] = True
+    if not (torch.is_grad_enabled() and student_global.requires_grad):
+        return                                    # validation pass; try again later
+    try:
+        ga = torch.autograd.grad(loss_a, student_global, retain_graph=True)[0].norm()
+        gb = torch.autograd.grad(loss_b, student_global, retain_graph=True)[0].norm()
+    except RuntimeError as e:                     # never let a diagnostic kill a run
+        print(f"  [teacher_mix] gradient probe skipped: {e}")
+        return
+    ga, gb = ga.item(), gb.item()
+    denom = mix * ga + (1 - mix) * gb
+    share = (mix * ga / denom) if denom > 0 else float("nan")
+    print(f"\n  [teacher_mix={mix:g}] measured on the first real batch:"
+          f"\n    A: loss {loss_a.item():9.4f}  |grad| {ga:.3e}"
+          f"\n    B: loss {loss_b.item():9.4f}  |grad| {gb:.3e}"
+          f"\n    -> teacher A supplies {100 * share:.1f}% of the structural "
+          f"gradient (loss-value share {100 * mix * loss_a.item() / max(1e-12, mix * loss_a.item() + (1 - mix) * loss_b.item()):.1f}%)."
+          f"\n    Set mix by the GRADIENT share; it is not the fusion alpha.\n")
+    if ga < 1e-6 or gb < 1e-6:
+        print(f"    WARNING: one teacher's gradient is ~0 -- that term is not "
+              f"training anything. Check its tau/standardize settings.\n")
 
 
 # ----------------------------------------------------------- struct loss ---
@@ -355,6 +527,65 @@ def _install(cfg):
     elif teacher != "dinov3":
         raise SystemExit(f"unknown +training.teacher={teacher!r} "
                          f"(dinov3|dinov3_gem|megaloc)")
+
+    teacher_b = _flag(cfg, "teacher_b")
+    if teacher_b:
+        teacher_b = str(teacher_b).lower()
+        if teacher not in _CACHED_GLOBAL or teacher_b not in _CACHED_GLOBAL:
+            raise SystemExit(
+                f"+training.teacher_b requires BOTH teachers to be cached "
+                f"globals ({'|'.join(_CACHED_GLOBAL)}); got teacher={teacher!r}, "
+                f"teacher_b={teacher_b!r}. teacher=dinov3 computes GeM "
+                f"in-training from patches and has no cache to pair -- use "
+                f"dinov3_gem, which is the same GeM(p=3) over the same patches.")
+        if teacher_b == teacher:
+            raise SystemExit(
+                f"+training.teacher_b={teacher_b!r} is the same as "
+                f"+training.teacher -- that is one teacher counted twice, not "
+                f"two targets.")
+
+        dir_b = _flag(cfg, "teacher_b_dir")
+        if not dir_b:
+            raise SystemExit(
+                f"+training.teacher_b={teacher_b} requires "
+                f"+training.teacher_b_dir=<dir written by "
+                f"{_CACHED_GLOBAL[teacher_b][1]}>")
+
+        mix = float(_flag(cfg, "teacher_mix"))
+        if not 0.0 <= mix <= 1.0:
+            raise SystemExit(f"training.teacher_mix={mix} must be in [0, 1]")
+        b_mask = bool(_flag(cfg, "teacher_b_mask_diag"))
+        b_std = bool(_flag(cfg, "teacher_b_standardize"))
+        tau_a = float(cfg.training.temperature)
+        tau_b = float(_flag(cfg, "teacher_b_temperature"))
+
+        _two.update(
+            dir_a=_state["teacher_dir"], file_a=_state["teacher_file"],
+            dir_b=str(dir_b), file_b=_CACHED_GLOBAL[teacher_b],
+            dim_a=_probe_width(_state["teacher_dir"], *_state["teacher_file"]),
+            loss_a=make_structural_loss(mask_diag, standardize),
+            loss_b=make_structural_loss(b_mask, b_std),
+            tau_a=tau_a, tau_b=tau_b, mix=mix)
+        dim_b = _probe_width(str(dir_b), *_CACHED_GLOBAL[teacher_b])
+
+        train.E_LiteVPRDataset = TwoTeacherDataset
+        train.compute_losses = compute_losses_two
+        print(f"  TWO TEACHERS: loss = {mix:g} * A + {1 - mix:g} * B")
+        print(f"    A = {teacher:11s} {_two['dim_a']:5d}-d  {_state['teacher_dir']}"
+              f"\n        mask_diag={mask_diag}  standardize={standardize}  "
+              f"tau={tau_a:g}")
+        print(f"    B = {teacher_b:11s} {dim_b:5d}-d  {dir_b}"
+              f"\n        mask_diag={b_mask}  standardize={b_std}  tau={tau_b:g}")
+        if b_std and tau_b < 0.2:
+            print(f"    WARNING: teacher_b_standardize=true with "
+                  f"teacher_b_temperature={tau_b:g} (the RAW-COSINE default) "
+                  f"gives a ~{1 / tau_b:.0f} sigma logit spread. Pass "
+                  f"+training.teacher_b_temperature=1.0.")
+        if not b_std and tau_b >= 0.5:
+            print(f"    WARNING: teacher_b_standardize=false with "
+                  f"teacher_b_temperature={tau_b:g}. Without z-scoring, tau is "
+                  f"in RAW cosine units; 0.05 is the setting that produced the "
+                  f"37.27 DINOv3 model.")
 
     if use_blocks:
         block = int(_flag(cfg, "block_size"))
