@@ -29,12 +29,19 @@ same cache -- no "which of these 4 clips am I in" shortcut satisfies a 4096-way
 discrimination, and separating that many requires real margin, so it penalises
 collapse directly.
 
-NO PROJECTION. The student's `proj` outputs 8448 and aligns in MegaLoc's raw
-space. A PCA or random basis would be one more thing fit to this corpus, and
-the point is zero-shot transfer to Brisbane and NSAVP. Cost is a 3.24M-param
-head and an 8448-d descriptor (the width MegaLoc itself ships). Both eval
-scripts work unchanged with `model.teacher_dim=8448` -- evaluate_nsavp.py:40
-imports build_model from evaluate_brisbane, so one override covers both.
+NOTHING IS FIT TO THIS CORPUS, AND THE SHIPPED MODEL IS UNCHANGED. Alignment
+uses a learned `nn.Linear(teacher_dim, 8448)` head on the STUDENT side only,
+trained with the model and DISCARDED at save time -- the SimCLR/BYOL
+arrangement, where the representation beneath the head is the one deployed.
+The teacher is never projected, so no basis is fit to DSEC/M3ED and zero-shot
+transfer is untouched.
+
+teacher_dim stays 1024, as in every prior run. Setting it to 8448 to match
+MegaLoc would widen model.py:51's PER-PATCH projection to (B, 576, 8448) =
+622 MB a forward and OOM a T4 -- the descriptor is not the only thing that
+scales. Keeping 1024 also means the .pth is architecturally identical to every
+earlier checkpoint, so evaluate_brisbane.py and evaluate_nsavp.py load it with
+no override at all.
 
 READ THE RESULT ON cross-condition d' AND retention via probe_all.py, NOT on
 the day-night sequence mean. Baseline to beat: effective rank 1.10/1024, night
@@ -60,7 +67,6 @@ Common prefix:
     datasets=dsec datasets@datasets_extra=m3ed \
     datasets.root_dir=$DSEC_ROOT   datasets.output_dir=$DSEC_FEATS \
     datasets_extra.root_dir=$M3ED_ROOT datasets_extra.output_dir=$M3ED_FEATS \
-    model.teacher_dim=8448 \
     training.patch_loss_weight=0.0 training.temperature=1.0 \
     +mega.teacher_dir=$MEGALOC_DIR
 
@@ -84,7 +90,7 @@ Score every checkpoint with:
   rm -rf /kaggle/working/brisbane_cache
   python scripts/probe_all.py datasets=brisbane datasets.root=$BRISBANE \
     phase1_weights=/kaggle/working/<ckpt>/last_phase1_histogram.pth \
-    data.modality=histogram datasets.dt=1.0 model.teacher_dim=8448 \
+    data.modality=histogram datasets.dt=1.0 \
     +probe.megaloc_dir=$MEGALOC_DIR
 """
 
@@ -256,7 +262,7 @@ def structural_loss(student_global, teacher_global, temperature):
 
 
 def infonce_loss(student_global, teacher_global, anchor_seq, anchor_pos, bank,
-                 bank_seq, bank_pos, n_neg, tau, window):
+                 bank_seq, bank_pos, n_neg, tau, window, head=None):
     """Align the student to the teacher's ABSOLUTE position.
 
     Positive: the frame's own teacher descriptor. Negatives: n_neg rows sampled
@@ -267,7 +273,15 @@ def infonce_loss(student_global, teacher_global, anchor_seq, anchor_pos, bank,
     apart two views of one place -- the exact opposite of the objective. Any
     negative from the anchor's own sequence within +/- window rows is masked.
     """
-    z_s = F.normalize(student_global.float(), p=2, dim=-1)
+    # `head` maps the student's descriptor into the teacher's width for the
+    # loss ONLY, and is thrown away at inference (SimCLR/BYOL projection head).
+    # The alternative -- model.teacher_dim=8448 -- would widen model.py:51's
+    # PER-PATCH projection to (B, 576, 8448) = 622 MB a forward and OOM a T4;
+    # every previous run was 1024-d for that reason. Discarding it also keeps
+    # the shipped .pth architecturally identical to those runs, so both eval
+    # scripts load it unchanged.
+    s = student_global.float() if head is None else head(student_global.float())
+    z_s = F.normalize(s, p=2, dim=-1)
     z_t = F.normalize(teacher_global.float(), p=2, dim=-1)
     pos = (z_s * z_t).sum(-1, keepdim=True)                        # (B, 1)
 
@@ -302,8 +316,8 @@ def _report_scales(struct, nce, student_global):
 
 
 # ------------------------------------------------------------------ loop ---
-def run_epoch(model, loader, optimizer, scaler, device, cfg, bank_t, sched,
-              train_mode, state):
+def run_epoch(model, head, loader, optimizer, scaler, device, cfg, bank_t,
+              sched, train_mode, state):
     bank, bank_seq, bank_pos, _ = bank_t
     struct_w = float(cfg.training.structural_loss_weight)
     nce_w = float(_m(cfg, "infonce_weight"))
@@ -315,6 +329,8 @@ def run_epoch(model, loader, optimizer, scaler, device, cfg, bank_t, sched,
     dim = _BANK["dim"]
 
     model.train(train_mode)
+    if head is not None:
+        head.train(train_mode)
     totals, n = torch.zeros(3), 0
     pbar = tqdm(loader, desc="Training" if train_mode else "Validation")
     for images, packed, _attn, _ts in pbar:
@@ -328,15 +344,21 @@ def run_epoch(model, loader, optimizer, scaler, device, cfg, bank_t, sched,
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train_mode):
+            # ONLY the forward runs under autocast. Both losses .float() their
+            # inputs, but inside an autocast region that is not enough --
+            # autocast re-casts the matmuls themselves, so `s @ s.T` and
+            # `z_s @ neg.T` would still run in fp16. Computing them out here
+            # makes the fp32 that structural_loss's docstring claims actually
+            # true, which matters most for the 8448-d InfoNCE dot products.
             with torch.autocast(device_type="cuda", enabled=amp):
                 _patches, student_global = model(images)
-                struct = (structural_loss(student_global, teacher_global, tau_kl)
-                          if struct_w else student_global.sum() * 0.0)
-                nce = (infonce_loss(student_global, teacher_global, anchor_seq,
-                                    anchor_pos, bank, bank_seq, bank_pos,
-                                    n_neg, tau_nce, window)
-                       if nce_w else student_global.sum() * 0.0)
-                loss = struct_w * struct + nce_w * nce
+            struct = (structural_loss(student_global, teacher_global, tau_kl)
+                      if struct_w else student_global.sum() * 0.0)
+            nce = (infonce_loss(student_global, teacher_global, anchor_seq,
+                                anchor_pos, bank, bank_seq, bank_pos,
+                                n_neg, tau_nce, window, head)
+                   if nce_w else student_global.sum() * 0.0)
+            loss = struct_w * struct + nce_w * nce
 
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss: struct={struct.item()} "
@@ -346,15 +368,20 @@ def run_epoch(model, loader, optimizer, scaler, device, cfg, bank_t, sched,
             if not state["reported"] and struct_w and nce_w:
                 _report_scales(struct, nce, student_global)
                 state["reported"] = True
+            # Clip EVERY optimised parameter, not just the model's: the
+            # InfoNCE head is in the optimiser too, and leaving it unclipped
+            # lets it take unbounded steps while the backbone is bounded --
+            # the head would absorb the alignment instead of the descriptor.
+            clip = [p for g in optimizer.param_groups for p in g["params"]]
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(clip, 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(clip, 1.0)
                 optimizer.step()
             if sched is not None:
                 sched.step()
@@ -381,6 +408,15 @@ def main(cfg: DictConfig):
             "exists -- read this file's docstring for the current commands.")
 
     torch.manual_seed(cfg.seed)
+    # Fail rather than train 30 epochs on CPU. The first launch of this script
+    # did exactly that -- torch reported "no accelerator is found", both runs
+    # fell back to CPU and exhausted host RAM instead of raising.
+    if not torch.cuda.is_available() and not bool(cfg.get("allow_cpu", False)):
+        raise SystemExit(
+            "CUDA is not available -- torch.cuda.is_available() is False.\n"
+            "Check the Kaggle notebook accelerator is set to GPU (T4 x2) and "
+            "that CUDA_VISIBLE_DEVICES names a real device.\n"
+            "Pass +allow_cpu=true only to smoke-test the wiring.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = bool(cfg.training.get("enable_amp", True)) and device.type == "cuda"
 
@@ -419,11 +455,10 @@ def main(cfg: DictConfig):
           f"over {len(probe_ds.sequence_names())} train sequences "
           f"({len(probe_ds)} pairs)")
 
-    if int(cfg.model.teacher_dim) != _BANK["dim"]:
-        raise SystemExit(
-            f"InfoNCE needs student and teacher in ONE space, but "
-            f"model.teacher_dim={cfg.model.teacher_dim} and the MegaLoc cache "
-            f"is {_BANK['dim']}-d. Pass model.teacher_dim={_BANK['dim']}.")
+    # No teacher_dim constraint: the InfoNCE head bridges the widths, and the
+    # KL never needed matching dims (it compares B x B similarity matrices on
+    # each side separately, which is how every prior run trained a 1024-d
+    # student against this 8448-d cache).
 
     # rebuild both splits against the cached-descriptor dataset class
     orig = T.E_LiteVPRDataset
@@ -464,9 +499,20 @@ def main(cfg: DictConfig):
         in_channels=cfg.data.input_channels,
     ).to(device)
 
+    # InfoNCE-only projection head, trained with the model and DISCARDED at
+    # save time -- only model.state_dict() is written, so the checkpoint stays
+    # loadable by the unmodified evaluate_brisbane/evaluate_nsavp build_model.
+    head = None
+    if float(_m(cfg, "infonce_weight")):
+        head = torch.nn.Linear(int(cfg.model.teacher_dim), _BANK["dim"]).to(device)
+        print(f"  InfoNCE head: {cfg.model.teacher_dim} -> {_BANK['dim']} "
+              f"({sum(p.numel() for p in head.parameters()) / 1e6:.1f}M params, "
+              f"not saved)")
+
     lr_base = cfg.training.get("lr_base_batch_size", cfg.training.batch_size)
     lr = cfg.training.learning_rate * (cfg.training.batch_size / lr_base) ** 0.5
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    params = list(model.parameters()) + (list(head.parameters()) if head else [])
+    optimizer = optim.AdamW(params, lr=lr)
     scaler = torch.amp.GradScaler("cuda") if amp else None
 
     sched = None
@@ -513,10 +559,10 @@ def main(cfg: DictConfig):
 
     for epoch in range(int(cfg.training.epochs)):
         print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
-        tr = run_epoch(model, train_dl, optimizer, scaler, device, cfg, bank_t,
-                       sched, True, state)
-        va = run_epoch(model, val_dl, optimizer, None, device, cfg, bank_t,
-                       None, False, state)
+        tr = run_epoch(model, head, train_dl, optimizer, scaler, device, cfg,
+                       bank_t, sched, True, state)
+        va = run_epoch(model, head, val_dl, optimizer, None, device, cfg,
+                       bank_t, None, False, state)
         print(f"Train Loss: {tr[0]:.6f} (kl: {tr[1]:.6f}, nce: {tr[2]:.6f})")
         print(f"Val   Loss: {va[0]:.6f} (kl: {va[1]:.6f}, nce: {va[2]:.6f})")
         wandb.log({"epoch": epoch + 1, "train_loss": tr[0], "train_kl": tr[1],
