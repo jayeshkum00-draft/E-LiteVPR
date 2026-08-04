@@ -110,7 +110,7 @@ import train as T
 
 # Written in the MAIN process before DataLoader workers fork; read inside
 # _get_features. A worker cannot write it back, so it must never be lazy.
-_BANK = {"dir": None, "offset": None, "dim": None}
+_BANK = {"dir": None, "seq_id": None, "dim": None}
 
 _DEFAULTS = {
     "teacher_dir": None,
@@ -170,11 +170,21 @@ class MegaLocDataset(E_LiteVPRDataset):
         arr = self._mmaps[seq]
         row = self._row_index[pair["feature_key"]]
         d = torch.from_numpy(np.ascontiguousarray(arr[row]).astype(np.float32))
-        gidx = torch.tensor([float(_BANK["offset"][seq] + row)])
-        return torch.cat([d, gidx]).unsqueeze(0), torch.zeros(1)
+        # (sequence id, row) rather than one global bank offset: VAL sequences
+        # are deliberately absent from the bank, so an offset lookup KeyErrors
+        # on the very first val probe. Only the exclusion mask needs these, and
+        # it compares ids and rows directly.
+        tail = torch.tensor([float(_BANK["seq_id"][seq]), float(row)])
+        return torch.cat([d, tail]).unsqueeze(0), torch.zeros(1)
 
 
-def build_bank(teacher_dir, sequences, device):
+def _features_dirs(ds):
+    """seq -> features_dir, across a single dataset or a Concat of sources."""
+    parts = getattr(ds, "datasets", None) or [ds]
+    return {s: p.features_dir for p in parts for s in p.sequence_names()}
+
+
+def build_bank(teacher_dir, train_ds, val_ds, device):
     """All train-split MegaLoc descriptors, L2-normalised, fp16 on device.
 
     21401 x 8448 fp16 is ~345 MB, so it lives on the GPU and a 4096-way
@@ -182,29 +192,45 @@ def build_bank(teacher_dir, sequences, device):
     within-sequence position, which is what makes same-place exclusion
     possible.
 
-    Deliberately does NOT take features_dir: with `datasets@datasets_extra`
-    the split is a ConcatE_LiteVPRDataset whose sources have DIFFERENT
-    features_dir values, so there is no single one to pass. Ordering is still
-    correct because the .npy is row-aligned with frames.txt -- which
-    _open_cache asserts per sequence on first access during training, so a
-    drifted cache fails there rather than silently shifting these offsets.
+    Sequence ids are assigned over TRAIN + VAL so a val frame can still be
+    compared against the mask, while only train rows enter the bank.
+
+    Row counts are asserted against frames.txt here, not just lazily in
+    _open_cache. An earlier version skipped it to stay Concat-safe and built a
+    bank of 18245 rows for a 21401-pair corpus without complaining -- a short
+    cache must fail at startup, not become a quietly truncated negative pool.
     """
-    descs, seq_ids, positions, offset, total = [], [], [], {}, 0
-    for sid, seq in enumerate(sorted(sequences)):
+    fdirs = {**_features_dirs(train_ds), **_features_dirs(val_ds)}
+    all_seqs = sorted(set(train_ds.sequence_names())
+                      | set(val_ds.sequence_names()))
+    seq_id = {s: i for i, s in enumerate(all_seqs)}
+
+    descs, seq_ids, positions, short = [], [], [], []
+    for seq in sorted(train_ds.sequence_names()):
         path = Path(teacher_dir) / seq / "megaloc.npy"
         if not path.is_file():
             raise FileNotFoundError(
                 f"{path} not found -- run cache_megaloc.py for this corpus.")
         arr = np.load(path)
-        offset[seq] = total
+        n_rows = sum(1 for ln in (Path(fdirs[seq]) / seq / "frames.txt")
+                     .read_text().splitlines() if ln.strip())
+        if arr.shape[0] != n_rows:
+            short.append(f"{seq}: cache {arr.shape[0]} vs frames.txt {n_rows}")
+            continue
         descs.append(torch.from_numpy(arr.astype(np.float32)))
-        seq_ids.append(torch.full((len(arr),), sid, dtype=torch.int32))
+        seq_ids.append(torch.full((len(arr),), seq_id[seq], dtype=torch.int32))
         positions.append(torch.arange(len(arr), dtype=torch.int32))
-        total += len(arr)
+
+    if short:
+        raise SystemExit(
+            "MegaLoc cache is not row-aligned with frames.txt for "
+            f"{len(short)} sequence(s) -- every target from these would be the "
+            "wrong frame. Re-run cache_megaloc.py for:\n  "
+            + "\n  ".join(short))
 
     bank = F.normalize(torch.cat(descs), p=2, dim=1).half().to(device)
     return (bank, torch.cat(seq_ids).to(device),
-            torch.cat(positions).to(device), offset)
+            torch.cat(positions).to(device), seq_id)
 
 
 # ------------------------------------------------------------------ loss ---
@@ -229,8 +255,8 @@ def structural_loss(student_global, teacher_global, temperature):
                     reduction="batchmean")
 
 
-def infonce_loss(student_global, teacher_global, anchor_idx, bank, bank_seq,
-                 bank_pos, n_neg, tau, window):
+def infonce_loss(student_global, teacher_global, anchor_seq, anchor_pos, bank,
+                 bank_seq, bank_pos, n_neg, tau, window):
     """Align the student to the teacher's ABSOLUTE position.
 
     Positive: the frame's own teacher descriptor. Negatives: n_neg rows sampled
@@ -248,8 +274,8 @@ def infonce_loss(student_global, teacher_global, anchor_idx, bank, bank_seq,
     idx = torch.randint(bank.shape[0], (n_neg,), device=bank.device)
     sim = z_s @ bank[idx].float().T                                # (B, K)
 
-    same = bank_seq[anchor_idx][:, None] == bank_seq[idx][None, :]
-    near = (bank_pos[anchor_idx][:, None] - bank_pos[idx][None, :]).abs() <= window
+    same = anchor_seq[:, None] == bank_seq[idx][None, :]
+    near = (anchor_pos[:, None] - bank_pos[idx][None, :]).abs() <= window
     sim = sim.masked_fill(same & near, float("-inf"))
 
     logits = torch.cat([pos, sim], dim=1) / tau
@@ -293,8 +319,10 @@ def run_epoch(model, loader, optimizer, scaler, device, cfg, bank_t, sched,
     pbar = tqdm(loader, desc="Training" if train_mode else "Validation")
     for images, packed, _attn, _ts in pbar:
         images = images.to(device, non_blocking=True)
-        packed = packed.to(device, non_blocking=True).squeeze(1)    # (B, D+1)
-        teacher_global, anchor_idx = packed[:, :dim], packed[:, dim].long()
+        packed = packed.to(device, non_blocking=True).squeeze(1)    # (B, D+2)
+        teacher_global = packed[:, :dim]
+        anchor_seq = packed[:, dim].long()
+        anchor_pos = packed[:, dim + 1].long()
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
@@ -304,9 +332,9 @@ def run_epoch(model, loader, optimizer, scaler, device, cfg, bank_t, sched,
                 _patches, student_global = model(images)
                 struct = (structural_loss(student_global, teacher_global, tau_kl)
                           if struct_w else student_global.sum() * 0.0)
-                nce = (infonce_loss(student_global, teacher_global, anchor_idx,
-                                    bank, bank_seq, bank_pos, n_neg, tau_nce,
-                                    window)
+                nce = (infonce_loss(student_global, teacher_global, anchor_seq,
+                                    anchor_pos, bank, bank_seq, bank_pos,
+                                    n_neg, tau_nce, window)
                        if nce_w else student_global.sum() * 0.0)
                 loss = struct_w * struct + nce_w * nce
 
@@ -382,12 +410,14 @@ def main(cfg: DictConfig):
     # Bank is built from TRAIN sequences only, so a val place can never be
     # drawn as a negative.
     print("Building negative bank...")
-    bank_t = build_bank(teacher_dir, probe_ds.sequence_names(), device)
-    bank, _bseq, _bpos, offset = bank_t
-    _BANK["offset"] = offset
+    bank_t = build_bank(teacher_dir, probe_ds, val_probe, device)
+    bank, _bseq, _bpos, seq_id = bank_t
+    _BANK["seq_id"] = seq_id
     _BANK["dim"] = int(bank.shape[1])
     print(f"  bank: {bank.shape[0]} descriptors x {bank.shape[1]}-d "
-          f"({bank.element_size() * bank.nelement() / 1e6:.0f} MB fp16)")
+          f"({bank.element_size() * bank.nelement() / 1e6:.0f} MB fp16) "
+          f"over {len(probe_ds.sequence_names())} train sequences "
+          f"({len(probe_ds)} pairs)")
 
     if int(cfg.model.teacher_dim) != _BANK["dim"]:
         raise SystemExit(
