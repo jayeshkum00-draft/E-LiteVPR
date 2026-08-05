@@ -12,7 +12,7 @@ from tqdm import tqdm
 import wandb
 
 from dataset import ConcatE_LiteVPRDataset, E_LiteVPRDataset
-from model import EventViTStudent, GeM
+from model import EventViTStudent, GeM, build_pooler
 
 
 def active_dataset_cfgs(cfg):
@@ -336,9 +336,15 @@ def main(cfg: DictConfig):
         num_patches=cfg.model.num_patches,   # must be 576 for the 384/ViT-L16 cache
         img_size=cfg.model.img_hw[0],        # must be 384
         in_channels=cfg.data.input_channels,
+        pooling=str(cfg.model.get('pooling', 'clamp')),
     ).to(device)
 
-    teacher_gem = GeM(p=3.0).to(device)
+    # The teacher's cached patches are ViT tokens and therefore signed too, so
+    # the clamp truncates the TARGET the same way it truncates the student's
+    # descriptor. Separate key from model.pooling so the two are ablatable one
+    # flag at a time.
+    teacher_gem = build_pooler(str(cfg.model.get('teacher_pooling', 'clamp')),
+                               p=3.0).to(device)
     for param in teacher_gem.parameters():
         param.requires_grad = False
 
