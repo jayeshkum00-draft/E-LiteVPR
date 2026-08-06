@@ -1,0 +1,144 @@
+# ViViD++ (DVXplorer 640x480 + Flea3 FL3-U3-13E4C-C 1280x1024) preprocessing
+# config for utils/preprocess_vivid.py.
+#
+# Sensor spec verified against the dataset's own Table II
+# (visibilitydataset.github.io/2_sequences.html) AND against the two bags on
+# disk: the DRIVING rig carries a DVXplorer at 640x480; only the HANDHELD rig
+# uses a DAVIS 240C at 240x180. 640x480 is DSEC's event resolution exactly, so
+# ViViD needs none of M3ED's geometry compromises -- no common-FOV box, no
+# match_aspect. The output is the full undistorted 640x480 event frame, which
+# stretches into the square 384x384 by the same 1.333 as DSEC, DDD20, Brisbane
+# and NSAVP. See utils/preprocess_vivid.py for the measurements.
+SENSOR_HW: [480, 640]              # DVXplorer resolution (H, W)
+event_hot_pixels_threshold: 99.5
+# HISTOGRAM ONLY. No voxel / timesurface keys here on purpose: this source
+# builds one modality, and the 3-column pairs line has no columns for the
+# others (unlike preprocess_m3ed.py, which emits 6 columns whose voxel and
+# timesurface paths are never written).
+
+# Frame selection is by TIMESTAMP, not by index stride, because the RGB rate
+# is NOT constant across the corpus -- measured from the header stamps:
+#   campus_morning_manual_small  19.995 Hz (50.01 ms)
+#   campus_night                 29.970 Hz (33.37 ms)
+# A DSEC-style "stride 4, window = [t[i-1], t[i]]" would therefore give a
+# 50 ms window in one bag and a 33 ms window in the next.
+#
+# 1 Hz, NOT DSEC's 5 Hz effective rate. DSEC gets 5 Hz because it is only
+# 0.887 hr total; M3ED runs at 2.0 because it is long. ViViD's driving set is
+# 4.32 hr (Table 1), so at 5 Hz it would yield ~99k pairs against a corpus of
+# 21.4k -- ViViD would BE the corpus. At 1 Hz the whole driving set is ~15.6k
+# pairs, night-only ~3.2k. The 50 ms window is unchanged and is what actually
+# reproduces DSEC's inter-frame span.
+# NOTE: a block=8 clip is 8 s of driving here vs 1.6 s in DSEC; M3ED already
+# mixes block durations into the corpus, so this is not a new property.
+target_hz: 1.0
+event_window_ms: 50                # events in [t_frame - window, t_frame)
+
+# How far the event stream must run past a frame before that frame is emitted.
+# The bag interleaves both topics inside bz2 chunks and is read in ONE pass, so
+# this is what makes the result independent of how far message write order lags
+# header order (measured lag on /camera/image_color: ~6.7 ms).
+flush_guard_ms: 200
+
+# Stationary-vehicle gate: drop pairs whose event window is near-empty, as
+# events per sensor pixel so the number does not depend on sensor resolution.
+#
+# M3ED's 0.25 ev/px does NOT transfer. Measured on campus_morning_manual_small
+# (571 windows, 50 ms, 5 Hz), the density is cleanly bimodal:
+#   stationary cluster  15 frames at 0.0073-0.0088 ev/px  (2.6%)
+#   EMPTY BIN           0.0130-0.0157 ev/px
+#   driving lobe        rises from ~0.011, mode ~0.11, median 0.136
+# so M3ED's 0.25 would delete ~75% of the driving lobe as well. 0.012 sits
+# above the stationary cluster and below every driving window.
+#
+# KNOWN LIMITATION -- this gate is inert at night, and no single value fixes
+# that. campus_night (2074 windows) has NO near-empty window at all: its floor
+# is 0.0223 ev/px, 3x the morning stationary cluster, and its median is 0.3506
+# (2.6x morning's). Night events keep firing while the vehicle is stopped --
+# streetlamp flicker and sensor noise, the regime dsec-night-is-noise.md
+# documents -- so a raw event-count gate cannot see a stopped car at night.
+# Raising the threshold to catch night's low tail (~2% below 0.10 ev/px, and
+# it is a smooth tail, not a separated cluster) would delete a quarter of
+# morning's DRIVING windows, since morning's median is only 0.136.
+# Set to 0.0 to keep every frame and ablate the choice.
+min_events_per_px: 0.012
+
+# Exposure filter, same keys/semantics as ddd20.yaml and m3ed.yaml. ViViD's
+# night frames are legitimately dark and its headlight/streetlamp frames
+# legitimately clipped, so these are set wide: the gate is a safety net for
+# genuinely blown frames, NOT a night filter. Tightening it would silently
+# remove exactly the low-light pairs this source is being added for.
+exposure_min_mean: 2
+exposure_max_mean: 250
+exposure_max_dark_frac: 0.90       # fraction of pixels <= 1
+exposure_max_bright_frac: 0.75     # fraction of pixels >= 254
+
+# Kalibr camchain shipped in ViViD's calibration_results/. cam0 = RGB
+# (EQUIDISTANT -- the RGB warp uses cv2.fisheye, not the radtan routine),
+# cam1 = DVS (radtan), cam1's T_cn_cnm1 = the cam0 -> cam1 transform.
+#
+# USE driving_results FOR campus_* / city_* / urban_* ONLY. The handheld rig
+# is a different camera pair (DAVIS 240C, 240x180); pointing this at an
+# outdoor_robust_* or indoor bag would be a silent calibration error, so
+# preprocess_vivid.py raises if the bag's EventArray resolution disagrees with
+# the camchain.
+camchain_path: '/placeholder/for/vivid/calibration_results/driving_results/camchain-dvsrgb.yaml'
+
+# Ablation knob for the measured constant vertical residual between the event
+# grid and cam1's intrinsics (cam1 was calibrated on /dvs/image_recon, i.e.
+# E2VID reconstructions, not on the raw event grid). null = pure calibration.
+# [0.0, -7.0] folds the measured correction into the RGB destination K.
+# Measured medians: dy = +6.5 px (morning) and +7.0 px (night, per-frame
+# +4..+9) and it is the SAME under R, identity and R.T, i.e. it is not
+# rotation; ty = -4.7 mm caps parallax at 0.3 px, i.e. it is not parallax.
+# ~1.5% of frame height, so it is irrelevant while patch_loss_weight = 0.0.
+rgb_principal_shift: null
+
+vivid_path: '/placeholder/for/vivid/ViViD_downloads'   # dir of *.bag (or one bag)
+
+# Visual-check mode: when set, preprocess_vivid.py writes
+# [RGB | events | overlay] PNGs here and writes NO .npy / pairs.txt.
+debug_overlay_dir: null
+debug_max_frames: 24               # frames spread across the WHOLE bag in that mode
+
+# --- training-side keys -----------------------------------------------------
+# Same key names as dsec.yaml/m3ed.yaml so train.py treats every source
+# uniformly:
+#   1. teacher caching -- `feature_extractor.py datasets=vivid`
+#   2. joint phase 1  -- `train.py datasets=dsec datasets@datasets_extra=vivid`
+root_dir: '/placeholder/for/preprocessed_vivid'   # preprocess_vivid.py output root
+output_dir: '/placeholder/for/vivid_features'     # teacher feature cache
+pairs_name: 'pairs.txt'
+
+# null -> every sequence in pairs.txt; [] -> source sits the split out.
+# Sequence name = the bag stem, e.g. 'campus_night'.
+train_seq_list: null
+val_seq_list: []          # train-only: val stays pure DSEC so val_loss and
+                          # early stopping stay comparable to earlier runs
+
+# Fed to the SAME day/night WeightedRandomSampler as dsec/m3ed. Driving-rig
+# night bags, from the dataset's own download listing. Durations from its
+# Table 1: campus-night 443 s, city-night 855 s, urban-night 598 s, plus the
+# LiDAR re-recordings lidar-campus-night 445 s and lidar-city-night 840 s,
+# i.e. ~53 min of night in total across BOTH driving sets.
+# *_evening bags are dusk, not night -- add them deliberately, as an ablation,
+# rather than by default.
+night_sequences: [
+  'campus_night',
+  'campus_night_2',
+  'city_night',
+  'urban_night'
+]
+
+# Handheld / indoor bags: different rig, different event sensor. Excluded so a
+# whole-directory run cannot silently mix them in with the driving camchain.
+to_exclude: [
+  'dark_aggresive', 'dark_robust', 'dark_unstable',
+  'global_aggressive', 'global_robust', 'global_unstable',
+  'local_aggressive', 'local_robust', 'local_unstable',
+  'varying_robust',
+  'outdoor_robust_day1', 'outdoor_robust_day2',
+  'outdoor_robust_night1', 'outdoor_robust_night2'
+]
+
+pair_stride: 1            # train-split subsampling / volume knob
