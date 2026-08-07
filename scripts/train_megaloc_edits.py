@@ -20,8 +20,8 @@ Deleted relative to train_megaloc.py: the InfoNCE term, its 1024->8448 head,
 the negative bank (and its ~345 MB of GPU memory), the +/-32 exclusion window,
 and the (seq id, row) tail the dataset packed for that mask. Nothing else.
 
-THE ONE NEW KNOB
-----------------
+THE KNOBS
+---------
 `model.pooling` (configs/model/student_model.yaml, default `clamp`) selects the
 student's patch aggregation. `signed` / `mean` register the pooler as `pool`
 rather than `gem`, so the stock evaluator refuses those checkpoints instead of
@@ -35,6 +35,34 @@ passing a flag.
 
 `train_dino_edits.py` calls `run()` below with the DINOv3 cache, so the two
 teachers differ by a filename and nothing else.
+
+BATCH SIZE -- `+edits.epoch_mult`, `+edits.val_batch_size`
+----------------------------------------------------------
+The loss is a KL between two B x B similarity matrices, so batch size is NOT a
+throughput knob here: it changes the OBJECTIVE. At B=32 each row is a 31-way
+relational target, at B=128 a 127-way one. Two consequences.
+
+1. Steps/epoch = num_samples / batch_size, so raising batch_size ALONE divides
+   the optimizer-step count -- 668 steps/epoch at B=32 becomes 167 at B=128,
+   and the comparison then conflates batch size with training length.
+   `epoch_mult` lengthens the EPOCH instead of the schedule (BlockSampler draws
+   with replacement, so epoch length is free), which leaves epochs,
+   early_stopping and warmup_frac counting exactly what they counted before:
+
+       epoch_mult = batch_size / 32   ->   668 steps/epoch at any batch size
+
+       training.batch_size=128 +edits.epoch_mult=4 +edits.val_batch_size=32
+
+   What it does NOT hold fixed is sample exposure: matched steps at B=128 draws
+   4x the samples. Both cannot be held fixed; state which one the run matched.
+
+2. val_loss is scale-dependent for the same reason -- a 127-way softmax is not
+   comparable to a 31-way one. Early stopping is relative and works either way,
+   but the two curves are not comparable and `best` is chosen on a different
+   criterion. `+edits.val_batch_size=32` pins it.
+
+Both default to the previous behaviour (epoch_mult=1.0, val at
+training.batch_size), so omitting them reproduces every earlier run exactly.
 
 COMMANDS (Kaggle paths -- see the `kaggle-run-layout` memory note)
 -----------------------------------------------------------------
@@ -88,6 +116,12 @@ _DEFAULTS = {
     "use_scheduler": True,
     "warmup_frac": 0.03,
     "min_lr_frac": 0.05,
+    # Blocks drawn per epoch as a multiple of len(train_ds). BlockSampler
+    # samples WITH replacement (block_sampler.py:120-130), so epoch length is a
+    # free parameter. 1.0 == every run before this flag existed.
+    "epoch_mult": 1.0,
+    # None -> validate at training.batch_size, i.e. previous behaviour.
+    "val_batch_size": None,
 }
 
 
@@ -248,20 +282,34 @@ def run(cfg: DictConfig, teacher_name, cache_file, cache_script):
 
     use_blocks = bool(_e(cfg, "use_block_sampler"))
     block = int(_e(cfg, "block_size"))
+    mult = float(_e(cfg, "epoch_mult"))
     if use_blocks:
         if int(cfg.training.batch_size) % block:
             raise SystemExit(f"batch_size={cfg.training.batch_size} must be a "
                              f"multiple of block_size={block}")
+        # num_samples controls blocks/epoch, hence steps/epoch. See the module
+        # docstring: this is what keeps the update count fixed when batch_size
+        # changes, so epochs / early_stopping / warmup_frac keep their meaning.
         sampler = BlockSampler(train_ds, night_seqs, block=block,
-                               night_frac=float(_e(cfg, "night_frac")))
+                               night_frac=float(_e(cfg, "night_frac")),
+                               num_samples=int(round(len(train_ds) * mult)))
     else:
+        if mult != 1.0:
+            raise SystemExit("+edits.epoch_mult applies to the block sampler "
+                             "only; with use_block_sampler=false it would be a "
+                             "silent no-op.")
         sampler = T.build_day_night_sampler(train_ds, night_seqs)
 
     train_dl = DataLoader(train_ds, batch_size=cfg.training.batch_size,
                           sampler=sampler, num_workers=cfg.num_workers,
                           pin_memory=True, drop_last=True,
                           persistent_workers=cfg.num_workers > 0)
-    val_dl = DataLoader(val_ds, batch_size=cfg.training.batch_size,
+    # structural_loss softmaxes over the other B-1 rows, so val KL at B=128 is
+    # a 127-way distribution and at B=32 a 31-way one -- different quantities on
+    # different scales. Pin this to compare val curves across batch sizes.
+    val_bs = _e(cfg, "val_batch_size")
+    val_bs = int(cfg.training.batch_size) if val_bs is None else int(val_bs)
+    val_dl = DataLoader(val_ds, batch_size=val_bs,
                         shuffle=False, num_workers=cfg.num_workers,
                         pin_memory=True,
                         persistent_workers=cfg.num_workers > 0)
@@ -305,6 +353,9 @@ def run(cfg: DictConfig, teacher_name, cache_file, cache_script):
     print(f"  student pooling={pooling}  blocks={use_blocks}"
           + (f" (block={block}, night_frac={float(_e(cfg, 'night_frac'))})"
              if use_blocks else ""))
+    print(f"  batch={int(cfg.training.batch_size)} (val {val_bs})  "
+          f"epoch_mult={mult:g}  ->  {len(train_dl)} steps/epoch, "
+          f"{len(train_dl) * int(cfg.training.epochs)} total steps")
     print(f"  loss = {float(cfg.training.structural_loss_weight):g} * "
           f"KL(mask_diag, standardize, tau="
           f"{float(cfg.training.temperature):g})   [no patch, no InfoNCE]")
