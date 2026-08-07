@@ -64,6 +64,20 @@ relational target, at B=128 a 127-way one. Two consequences.
 Both default to the previous behaviour (epoch_mult=1.0, val at
 training.batch_size), so omitting them reproduces every earlier run exactly.
 
+A THIRD CORPUS
+--------------
+`train.active_dataset_cfgs` takes exactly two sources (cfg.datasets and
+cfg.datasets_extra) and train.py is not edited, so `_dataset_cfgs` below also
+picks up any further `datasets_extra<N>` group, in name order:
+
+    datasets=dsec datasets@datasets_extra=m3ed +datasets@datasets_extra2=vivid
+
+`+edits.teacher_dir` correspondingly accepts a COMMA-SEPARATED list of roots.
+Each corpus keeps its own MegaLoc cache -- the DSEC+M3ED one lives on a
+read-only /kaggle/input mount and cannot be extended in place -- and the first
+root holding <seq>/<file> wins. Sequence names are unique across the corpora,
+so the search is unambiguous. A single root behaves exactly as before.
+
 COMMANDS (Kaggle paths -- see the `kaggle-run-layout` memory note)
 -----------------------------------------------------------------
   python scripts/train_megaloc_edits.py \
@@ -106,7 +120,7 @@ from train_megaloc import structural_loss
 
 # Written in the MAIN process before the DataLoader workers fork; read inside
 # _get_features. A worker cannot write it back, so it must never be lazy.
-_CACHE = {"dir": None, "file": None}
+_CACHE = {"dir": None, "file": None}      # "dir" is a LIST of roots
 
 _DEFAULTS = {
     "teacher_dir": None,
@@ -131,7 +145,35 @@ def _e(cfg, key):
 
 
 # --------------------------------------------------------------- dataset ---
-def _open_cache(root, seq, features_dir, fname):
+def _dataset_cfgs(cfg):
+    """train.active_dataset_cfgs + any `datasets_extra<N>` group beyond the
+    first, so a third/fourth corpus needs no edit to train.py."""
+    cfgs = list(T.active_dataset_cfgs(cfg))
+    for key in sorted(str(k) for k in cfg.keys()
+                      if str(k).startswith("datasets_extra")
+                      and str(k) != "datasets_extra"):
+        extra = cfg.get(key)
+        if extra is not None:
+            cfgs.append(extra)
+    return cfgs
+
+
+def _find_cache(roots, seq, fname):
+    """First root holding <seq>/<fname>. Sequence names are unique across
+    corpora, so this cannot pick the wrong corpus's cache."""
+    tried = []
+    for root in roots:
+        path = Path(root) / seq / fname
+        tried.append(path)
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"{seq}/{fname} not found under any of "
+        f"{[str(t) for t in tried]} -- cache that corpus first "
+        f"(cache_megaloc.py for megaloc.npy, cache_teacher_gem.py for gem.npy).")
+
+
+def _open_cache(roots, seq, features_dir, fname):
     """mmap <root>/<seq>/<fname>, asserting row alignment with frames.txt.
 
     dataset.py maps a pair to a cache row through _row_index, which is built
@@ -139,11 +181,7 @@ def _open_cache(root, seq, features_dir, fname):
     frames, so every target after it would be the wrong frame -- fail here, not
     silently.
     """
-    path = Path(root) / seq / fname
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"{path} not found -- cache this corpus first "
-            f"(cache_megaloc.py for megaloc.npy, cache_teacher_gem.py for gem.npy).")
+    path = _find_cache(roots, seq, fname)
     arr = np.load(path, mmap_mode="r")
     n_rows = sum(1 for ln in (Path(features_dir) / seq / "frames.txt")
                  .read_text().splitlines() if ln.strip())
@@ -174,8 +212,8 @@ class CachedGlobalDataset(E_LiteVPRDataset):
         return d.unsqueeze(0), torch.zeros(1)
 
 
-def _probe_width(teacher_dir, seq, fname):
-    return int(np.load(Path(teacher_dir) / seq / fname, mmap_mode="r").shape[1])
+def _probe_width(roots, seq, fname):
+    return int(np.load(_find_cache(roots, seq, fname), mmap_mode="r").shape[1])
 
 
 # ------------------------------------------------------------------ loop ---
@@ -254,8 +292,9 @@ def run(cfg: DictConfig, teacher_name, cache_file, cache_script):
                          "target: pass training.patch_loss_weight=0.0")
 
     pooling = str(cfg.model.get("pooling", "clamp"))
-    dataset_cfgs = T.active_dataset_cfgs(cfg)
-    _CACHE["dir"], _CACHE["file"] = str(teacher_dir), cache_file
+    dataset_cfgs = _dataset_cfgs(cfg)
+    roots = [t.strip() for t in str(teacher_dir).split(",") if t.strip()]
+    _CACHE["dir"], _CACHE["file"] = roots, cache_file
 
     print("Initializing datasets...")
     orig = T.E_LiteVPRDataset
@@ -345,11 +384,15 @@ def run(cfg: DictConfig, teacher_name, cache_file, cache_script):
         print(f"  LR schedule: {warm} warmup then cosine to {floor:g}x over "
               f"{total} steps")
 
-    width = _probe_width(teacher_dir, sorted(train_ds.sequence_names())[0],
+    width = _probe_width(roots, sorted(train_ds.sequence_names())[0],
                          cache_file)
     print("=" * 70)
     print(f"{teacher_name}_edits: teacher={teacher_name}({width}-d) "
-          f"<- {teacher_dir}/<seq>/{cache_file}")
+          f"<- {len(roots)} root(s)/<seq>/{cache_file}")
+    for r in roots:
+        print(f"    {r}")
+    print(f"  corpora: {len(dataset_cfgs)} source(s), "
+          f"{len(train_ds.sequence_names())} train sequences")
     print(f"  student pooling={pooling}  blocks={use_blocks}"
           + (f" (block={block}, night_frac={float(_e(cfg, 'night_frac'))})"
              if use_blocks else ""))
