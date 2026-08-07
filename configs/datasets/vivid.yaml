@@ -125,7 +125,6 @@ val_seq_list: []          # train-only: val stays pure DSEC so val_loss and
 # rather than by default.
 night_sequences: [
   'campus_night',
-  'campus_night_2',
   'city_night',
   'urban_night'
 ]
