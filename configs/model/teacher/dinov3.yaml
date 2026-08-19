@@ -1,0 +1,14 @@
+# Table IV ablation teacher (self-supervised, no place-level supervision).
+# Filename is dinov3.npy, NOT the old gem.npy: that cache was pooled with the
+# clamped GeM, which no longer exists anywhere in this codebase.
+name: dinov3
+cache_file: dinov3.npy
+dim: 1024
+
+source: hf
+hf_model: "facebook/dinov3-vitl16-pretrain-lvd1689m"
+expected_patches: 576             # (384//16)**2
+
+input_size: 384
+batch_size: 16
+enable_amp: true

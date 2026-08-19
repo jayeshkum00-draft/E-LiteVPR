@@ -1,0 +1,7 @@
+# Descriptor dim = num_clusters * cluster_dim + token_dim = 8448, matching
+# MegaLoc's width. Table IV ablation; the shipped model uses gem.
+name: salad
+num_clusters: 64
+cluster_dim: 128  # tokens projected teacher_dim -> this before clustering
+token_dim: 256    # CLS-token global branch
+sinkhorn_iters: 3

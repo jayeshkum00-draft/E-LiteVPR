@@ -1,0 +1,13 @@
+# Student: ViT-S/16 on DINOv3 weights, input BatchNorm, shared linear
+# projection, then the aggregator group below.
+
+defaults:
+  - aggregator: gem
+  - _self_
+
+backbone_name: 'vit_small_patch16_dinov3.lvd1689m'
+img_hw: [384, 384]
+patch_size: 16
+num_patches: 576            # (384//16)**2
+proj_dim: 1024              # projection width; independent of the teacher's,
+                            # which the B x B objective never meets

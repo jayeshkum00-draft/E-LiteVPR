@@ -1,0 +1,61 @@
+sensor_hw: [480, 640]              # DVXplorer; the driving rig, not the handheld DAVIS 240C
+hot_pixel_threshold: 99.5
+
+# Frame selection is by TIMESTAMP because the RGB rate is not constant across
+# the corpus (campus_morning 19.995 Hz, campus_night 29.970 Hz). 1 Hz, not
+# DSEC's 5 Hz: the driving set is 4.32 hr, so 5 Hz would make ViViD the corpus.
+target_hz: 1.0
+event_window_ms: 50                # events in [t_frame - window, t_frame)
+flush_guard_ms: 200                # event run-past before a frame is emitted
+
+# Stationary-vehicle gate. M3ED's 0.25 does NOT transfer -- morning's median
+# window is 0.136 ev/px. Inert at night by construction; see preprocess_vivid.py.
+min_events_per_px: 0.012
+
+# Wide on purpose: ViViD's night frames are legitimately dark and its
+# headlight frames legitimately clipped, so this is a blown-frame safety net,
+# NOT a night filter. Tightening it removes the low-light pairs we added ViViD for.
+exposure_min_mean: 2
+exposure_max_mean: 250
+exposure_max_dark_frac: 0.90       # fraction of pixels <= 1
+exposure_max_bright_frac: 0.75     # fraction of pixels >= 254
+
+# driving_results ONLY -- the handheld rig is a different camera pair, and
+# preprocess_vivid.py raises if the bag's resolution disagrees with the camchain.
+camchain_path: '/placeholder/for/vivid/calibration_results/driving_results/camchain-dvsrgb.yaml'
+
+# Ablation knob for the measured constant vertical residual (cam1 was
+# calibrated on E2VID reconstructions, not the raw event grid). null = pure
+# calibration; [0.0, -7.0] folds the measured correction in.
+rgb_principal_shift: null
+
+vivid_path: '/placeholder/for/vivid/ViViD_downloads'   # dir of *.bag (or one bag)
+
+debug_overlay_dir: null            # set -> overlay PNGs only, no .npy / pairs.txt
+debug_max_frames: 24
+
+root_dir: '/placeholder/for/preprocessed_vivid'
+features_dir: '/placeholder/for/vivid_features'
+pairs_name: 'pairs.txt'
+pair_stride: 1
+
+# null -> every sequence in pairs.txt; [] -> source sits the split out.
+train_seq_list: null
+val_seq_list: []          # val stays pure DSEC so early stopping stays comparable
+
+# *_evening bags are dusk, not night -- add them deliberately, as an ablation.
+night_sequences: [
+  'campus_night',
+  'city_night',
+  'urban_night'
+]
+
+# Handheld / indoor bags: different rig, different event sensor.
+to_exclude: [
+  'dark_aggresive', 'dark_robust', 'dark_unstable',
+  'global_aggressive', 'global_robust', 'global_unstable',
+  'local_aggressive', 'local_robust', 'local_unstable',
+  'varying_robust',
+  'outdoor_robust_day1', 'outdoor_robust_day2',
+  'outdoor_robust_night1', 'outdoor_robust_night2'
+]

@@ -1,0 +1,12 @@
+name: megaloc
+cache_file: megaloc.npy
+dim: 8448
+
+source: hub
+hub_repo: gmberton/MegaLoc
+hub_entry: get_trained_model
+
+# DINOv2-based, so H and W must be multiples of 14; the corpus is 384x384.
+input_size: 378
+batch_size: 32
+enable_amp: true

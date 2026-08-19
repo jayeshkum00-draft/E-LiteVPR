@@ -1,0 +1,28 @@
+name: phase1                # goes into checkpoint names
+epochs: 30
+batch_size: 32              # 4 clips of 8; also the objective's B x B width
+learning_rate: 1.0e-4       # AdamW, at batch_size == lr_base_batch_size
+lr_base_batch_size: 32      # train.py scales lr by sqrt(batch_size / this)
+enable_amp: true
+
+structural_loss_weight: 1.0
+temperature: 1.0            # sigma units: both matrices are z-scored
+
+# Directory written by feature_extractor.py, comma-separated for several
+# corpora. null -> each source's own datasets.output_dir.
+teacher_dir: null
+
+# Contiguous clips, day/night balanced per clip. false -> per-sample sampler.
+use_block_sampler: true
+block_size: 8
+night_frac: 0.5
+
+use_scheduler: true
+warmup_frac: 0.03
+min_lr_frac: 0.05
+
+# Blocks drawn per epoch as a multiple of len(train_ds); keeps steps/epoch
+# fixed when batch_size changes. Block sampling draws with replacement, so
+# epoch length is free. Set to batch_size/32.
+epoch_mult: 1.0
+val_batch_size: null        # null -> training.batch_size

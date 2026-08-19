@@ -1,0 +1,12 @@
+name: mixvpr
+cache_file: mixvpr.npy
+dim: 4096
+
+# Architecture comes from external/ensemble_event_vpr_bench so it cannot drift
+# from the scored model; weights are an explicit path, never a gdown fetch.
+source: bench
+weights: null
+
+input_size: 384                   # native; the model resizes to 320 itself
+batch_size: 32
+enable_amp: true

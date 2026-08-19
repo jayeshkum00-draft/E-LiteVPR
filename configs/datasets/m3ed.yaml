@@ -1,0 +1,39 @@
+sensor_hw: [720, 1280]
+hot_pixel_threshold: 99.5
+
+target_hz: 2.0                     # OVC runs at 25 Hz; subsampled by TIMESTAMP
+event_window_ms: 50                # events in [t_frame - window, t_frame]
+
+min_events_per_px: 0.25            # stationary-vehicle gate; see preprocess_m3ed.py
+exposure_min_mean: 10
+exposure_max_mean: 245
+exposure_max_dark_frac: 0.60      # fraction of pixels <= 1
+exposure_max_bright_frac: 0.75    # fraction of pixels >= 254
+
+# Aspect the common-FOV crop is trimmed to before the square resize, matching
+# every other source. null keeps the full FOV; see crop_box_to_aspect.
+match_aspect: 1.3333333
+
+m3ed_path: '/placeholder/for/m3ed_path'   # dir of <seq>_data.h5 files (or one file)
+
+debug_overlay_dir: null           # set -> overlay PNGs only, no .npy / pairs.txt
+debug_max_frames: 24
+
+root_dir: '/placeholder/for/preprocessed_m3ed'
+features_dir: '/placeholder/for/m3ed_features'
+pairs_name: 'pairs.txt'
+pair_stride: 1
+
+# null -> every sequence in pairs.txt; [] -> source sits the split out.
+train_seq_list: null
+val_seq_list: []          # val stays pure DSEC so early stopping stays comparable
+
+night_sequences: [
+  'car_urban_night_penno_big_loop',
+  'car_urban_night_penno_small_loop',
+  'car_urban_night_penno_small_loop_darker',
+  'car_urban_night_rittenhouse',
+  'car_urban_night_ucity_small_loop'
+]
+
+to_exclude: ['falcon_outdoor_day_penno_cars']

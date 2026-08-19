@@ -1,0 +1,52 @@
+# NSAVP zero-shot evaluation, protocol-matched to
+# external/ensemble_event_vpr_bench (Joseph, Fischer & Milford, arXiv:2509.01968).
+#
+# Protocol facts replicated from datasets/nsvap.py + vpr_methods_evaluation/main.py:
+#   * poses from <seq>_applanix.h5 : pose_base_link/{timestamps,positions[:, :2]},
+#     already metric (metres) -- no lat/lon projection
+#   * pose grid resampled at min_time_res, traverse trimmed to the first
+#     moving sample (speed > 0), no other stationary filter
+#   * contiguous, non-overlapping bins of `dt` seconds; GT sampled at the BIN
+#     START (bench convention, see gt_at_bin)
+#   * positives = references within 25 m of the query; R@1 denominator excludes
+#     queries with no positive (bench's positives_per_query convention)
+
+root: /workspace/E-LiteVPR/datasets/nsavp   # holds h5_data/<seq>_*.h5
+
+# bench sequences (indices 6..11 in testing.py's flat sequence list)
+sequences:
+  - R0_FA0        # forward, afternoon
+  - R0_FS0        # forward, sunset
+  - R0_FN0        # forward, night
+  - R0_RA0        # reverse, afternoon
+  - R0_RS0        # reverse, sunset
+  - R0_RN0        # reverse, night
+
+# the bench's five NSAVP experiment pairs: (6,7)(6,8)(8,7)(9,11)(10,11)
+pairs:
+  - [R0_FA0, R0_FS0]
+  - [R0_FA0, R0_FN0]        # the decisive day->night cell
+  - [R0_FN0, R0_FS0]
+  - [R0_RA0, R0_RN0]
+  - [R0_RS0, R0_RN0]
+
+sensor_hw: [480, 640]           # DVXplorer (H, W)
+dt: 1.0                         # bin width = bench `time_res`
+min_time_res: 0.01              # pose resample step (bench default)
+gt_at_bin: start                # 'start' = bench parity; 'mid' = brisbane-style
+
+gt_threshold_m: 25.0            # main.py hardcodes positive_dist_threshold = 25
+seq_lengths: [1, 10, 20, 30]
+
+# representation parameters -- must match DSEC preprocessing (same values as
+# configs/datasets/brisbane.yaml)
+hot_pixel_threshold: 99.5       # per-window mask, as in training / brisbane.yaml
+voxel_bins: 3
+timesurface_decay_frac: 1.0
+
+batch_size: 32
+max_events_per_chunk: 200_000_000   # streaming budget; traverses are ~4.25e9
+                                    # events and do not fit in RAM
+
+cache_dir: /workspace/E-LiteVPR/nsavp_cache
+results_csv: /workspace/E-LiteVPR/nsavp_results_{modality}_dt{dt}.csv
