@@ -14,13 +14,13 @@ exposure_max_bright_frac: 0.75    # fraction of pixels >= 254
 # every other source. null keeps the full FOV; see crop_box_to_aspect.
 match_aspect: 1.3333333
 
-m3ed_path: '/placeholder/for/m3ed_path'   # dir of <seq>_data.h5 files (or one file)
+m3ed_path: '/workspace/E-LiteVPR/datasets/m3ed'   # dir of <seq>_data.h5 files (or one file)
 
 debug_overlay_dir: null           # set -> overlay PNGs only, no .npy / pairs.txt
 debug_max_frames: 24
 
-root_dir: '/placeholder/for/preprocessed_m3ed'
-features_dir: '/placeholder/for/m3ed_features'
+root_dir: '/workspace/E-LiteVPR/outputs/preprocessed_m3ed'
+features_dir: '/workspace/E-LiteVPR/outputs/m3ed_features'
 pairs_name: 'pairs.txt'
 pair_stride: 1
 
