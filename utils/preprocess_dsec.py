@@ -283,9 +283,9 @@ def process_sequence(seq, rgb_dir, events_dir, calibrations_dir, pairs_dir, prep
 def build_pairs(cfg: DictConfig):
     # Builds pairs of RGB and Event data based on timestamps and saves them in the specified output directory.
     dataset_path = Path(cfg.dsec_path)
-    out_root = Path(cfg.output_dir) / "preprocessed_dsec"
-    preprocessed_rgb_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "rgb"
-    preprocessed_events_hist_dir = Path(cfg.output_dir) / "preprocessed_dsec" / "events" / "histogram"
+    out_root = Path(cfg.features_dir) / "preprocessed_dsec"
+    preprocessed_rgb_dir = Path(cfg.features_dir) / "preprocessed_dsec" / "rgb"
+    preprocessed_events_hist_dir = Path(cfg.features_dir) / "preprocessed_dsec" / "events" / "histogram"
     pairs_dir = out_root / "pairs_dsec"
 
     preprocessed_rgb_dir.mkdir(parents=True, exist_ok=True)
