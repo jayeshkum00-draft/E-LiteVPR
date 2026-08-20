@@ -433,6 +433,11 @@ def build_pairs(cfg: DictConfig):
         h5_paths = [dataset_path]
     else:
         h5_paths = sorted(dataset_path.glob('*_data.h5')) or sorted(dataset_path.glob('*.h5'))
+    if not h5_paths:
+        raise SystemExit(
+            f'No *_data.h5 or *.h5 directly under datasets.m3ed_path={dataset_path} '
+            f'(the glob is NOT recursive). Point it at the directory that holds '
+            f'the h5 files, or at one file.')
     # M3ED ships <sequence>_data.h5 alongside <sequence>_pose_gt.h5 / _depth_gt.h5;
     # the sequence name is the stem without the _data suffix.
     sequences = [p.stem[:-5] if p.stem.endswith('_data') else p.stem for p in h5_paths]
