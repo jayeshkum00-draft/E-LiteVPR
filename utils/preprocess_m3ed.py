@@ -1,75 +1,3 @@
-"""
-M3ED preprocessor for E-LiteVPR.
-
-Reads M3ED `<sequence>_data.h5` files (one per sequence, e.g.
-car_urban_day_horse_data.h5) and writes paired RGB/event representations in
-the same output format as the other preprocessors: <seq>/rgb/ + <seq>/events/
-histogram/ .npy files plus a master pairs.txt with the 3-column line format
-`timestamp_us,rgb/<name>.npy,events/histogram/<name>.npy`.
-
-Sensor layout -- verified against car_urban_day_horse_data.h5, not assumed:
-  ovc/rgb/data          (N, 800, 1280, 3) uint8, 25 Hz global-shutter colour
-  ovc/ts                (N,) int64 microseconds
-  prophesee/left/{x,y,t,p}  Prophesee EVK4 HD, 1280x720, t in the SAME
-                        microsecond clock as ovc/ts (both start at 0)
-  prophesee/left/ms_map_idx  first event index of each whole millisecond --
-                        used to slice arbitrary time windows without loading
-                        the (4e8-element) event arrays.
-  */calib/{intrinsics, distortion_coeffs, resolution, T_to_prophesee_left}
-                        pinhole + radtan for every camera, extrinsics given
-                        as the transform INTO the prophesee-left frame.
-
-Geometry -- why this differs from both existing preprocessors
--------------------------------------------------------------
-DDD20 is a single DAVIS chip: APS and DVS share one pixel array, nothing to
-align. DSEC ships images and events already stereo-rectified into a common
-plane, so aligning them is just an intrinsics-ratio crop. M3ED ships neither:
-both streams are RAW (radtan-distorted) and the two cameras sit 7.6 cm apart
-with a small relative rotation (~0.6 deg). So we do the rectification here:
-
-  events : undistorted with a DSEC-style FORWARD map (raw pixel ->
-           fractional undistorted pixel), built once per sequence with
-           cv2.undistortPoints over the full pixel grid and consumed by the
-           same rectify_event_coords / bilinear-splat path as DSEC. The map
-           is fractional on purpose -- see preprocess_dsec.rectify_event_coords
-           for why nearest-neighbour rounding bakes a lattice into the frames.
-  RGB    : warped directly INTO the undistorted event frame by the infinite
-           homography K_evt @ R_evt<-rgb @ K_rgb^-1 (cv2.initUndistortRectifyMap
-           with R = the rotation block of ovc/rgb/calib/T_to_prophesee_left and
-           P = K_evt), which removes RGB distortion and the inter-camera
-           rotation in one remap.
-
-The homography ignores the 7.6 cm translation, i.e. it is exact only at
-infinite depth; residual parallax is f*B/Z = 1032*0.076/Z ~= 78/Z px, so
-~1.6 px at 50 m and ~3.9 px at 20 m on the 1280-wide frame -- under 1.2 px
-after the resize to 384. That is strictly tighter than DSEC, whose 60 cm
-baseline is left uncorrected by the FOV crop, so it does not introduce a
-misalignment mode the corpus does not already contain.
-
-Measured, not assumed (car_urban_day_horse, correlation between the event
-magnitude image and the RGB gradient magnitude, scanned over +-6 px on the
-384 grid): the peak sits at (dx, dy) = (0, +2) on every frame tested --
-horizontally exact, and 2 px vertical, which is the expected sign and size
-of the residual parallax (the extrinsic translation is mostly vertical,
-ty = -7.6 cm, and 2 px on 384 = 6.5 px full-res => a ~12 m median scene
-depth). Dropping the calibrated rotation moves the peak to dx = -2 and cuts
-the zero-shift correlation by 30-70%, so the extrinsic warp is doing real
-work and is not being fitted to noise.
-
-The OVC has a narrower FOV than the event camera (fx 1264 vs 1032), so the
-warp leaves invalid borders. We crop both streams to the largest common
-valid box (computed once per sequence from the remap's validity mask) before
-resizing, so no frame contains black filler.
-
-Usage (run with the `m3ed` datasets group, since config.yaml defaults to `dsec`):
-    uv run python utils/preprocess_m3ed.py datasets=m3ed \
-        datasets.m3ed_path=/path/to/m3ed/h5s output_dir=/path/to/out
-
-    # visual check: dumps side-by-side + overlay PNGs instead of writing pairs
-    uv run python utils/preprocess_m3ed.py datasets=m3ed \
-        datasets.m3ed_path=... datasets.debug_overlay_dir=~/Desktop/m3ed_check
-"""
-
 import os
 from pathlib import Path
 
@@ -488,7 +416,8 @@ def process_sequence(seq, h5_path, pairs_dir, out_root, cfg, overlay_dir=None):
 @hydra.main(version_base=None, config_path='../configs', config_name='config')
 def build_pairs(cfg: DictConfig):
     dataset_path = Path(cfg.datasets.m3ed_path)
-    out_root = Path(cfg.output_dir) / 'preprocessed_m3ed'
+    out_root = Path(cfg.datasets.root_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
     pairs_dir = out_root / 'pairs_m3ed'
 
     overlay_dir = cfg.datasets.get('debug_overlay_dir', None)
